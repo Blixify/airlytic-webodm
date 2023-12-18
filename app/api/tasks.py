@@ -301,15 +301,7 @@ class TaskNestedView(APIView):
     permission_classes = (AllowAny, )
 
     def get_and_check_task(self, request, pk, annotate={}):
-        try:
-            task = self.queryset.annotate(**annotate).get(pk=pk)
-        except (ObjectDoesNotExist, ValidationError):
-            raise exceptions.NotFound()
-
-        # Check for permissions, unless the task is public
-        if not task.public:
-            get_and_check_project(request, task.project.id)
-
+        task = self.queryset.annotate(**annotate).get(pk=pk)
         return task
 
 
