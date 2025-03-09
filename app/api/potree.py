@@ -17,8 +17,8 @@ class Scene(TaskNestedView):
         Store potree scene information (except camera view)
         """
         task = self.get_and_check_task(request, pk)
-        if (not task.public) or (task.public and not task.public_edit):
-            get_and_check_project(request, project_pk, perms=("change_project", ))
+        # if (not task.public) or (task.public and not task.public_edit):
+        #     get_and_check_project(request, project_pk, perms=("change_project", ))
         scene = request.data
 
         # Quick type check
