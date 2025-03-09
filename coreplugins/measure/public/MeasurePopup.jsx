@@ -4,7 +4,7 @@ import './MeasurePopup.scss';
 import Utils from 'webodm/classes/Utils';
 import Workers from 'webodm/classes/Workers';
 import { _, interpolate } from 'webodm/classes/gettext';
-
+import { systems, unitSystem, getUnitSystem } from 'webodm/classes/Units';
 import $ from 'jquery';
 import L from 'leaflet';
 
@@ -50,21 +50,25 @@ export default class MeasurePopup extends React.Component {
   }
 
   getProperties(){
-    const result = {
-      Length: this.props.model.length,
-      Area: this.props.model.area
-    };
+    const us = systems[this.lastUnitSystem];
 
+    const result = {
+      Length: us.length(this.props.model.length).value,
+      Area: us.area(this.props.model.area).value
+    };
+    
     if (this.state.volume !== null && this.state.volume !== false){
-        result.Volume = this.state.volume;
+        result.Volume = us.volume(this.state.volume).value;
         result.BaseSurface = this.state.baseMethod;
     }
+
+    result.UnitSystem = this.lastUnitSystem;
     
     return result;
   }
 
   getGeoJSON(){
-    const geoJSON = this.props.resultFeature.toGeoJSON();
+    const geoJSON = this.props.resultFeature.toGeoJSON(14);
     geoJSON.properties = this.getProperties();
     return geoJSON;
   }
@@ -121,7 +125,7 @@ export default class MeasurePopup extends React.Component {
         type: 'POST',
         url: `/api/plugins/measure/task/${task.id}/volume`,
         data: JSON.stringify({
-          area: this.props.resultFeature.toGeoJSON(),
+          area: this.props.resultFeature.toGeoJSON(14),
           method: baseMethod
         }),
         contentType: "application/json"
@@ -135,7 +139,7 @@ export default class MeasurePopup extends React.Component {
                       else this.setState({volume: parseFloat(volume)});
                   }, `/api/plugins/measure/task/${task.id}/volume/get/`);
               }
-            }, `/api/plugins/measure/task/${task.id}/volume/check/`);
+            });
         }else if (result.error){
             this.setState({error: result.error});
         }else{
@@ -167,6 +171,9 @@ export default class MeasurePopup extends React.Component {
 
   render(){
     const { volume, error, featureType } = this.state;
+    const us = unitSystem();
+    this.lastUnitSystem = getUnitSystem();
+
     const baseMethods = [
       {label: _("Triangulate"), method: 'triangulate'},
       {label: _("Plane"), method: 'plane'},
@@ -175,12 +182,12 @@ export default class MeasurePopup extends React.Component {
       {label: _("Lowest"), method: 'lowest'}];
 
     return (<div className="plugin-measure popup">
-        {featureType == "Polygon" && <p>{_("Area:")} {this.props.model.areaDisplay}</p>}
         {featureType == "Polygon" && <p>{_("Perimeter:")} {this.props.model.lengthDisplay}</p>}
+        {featureType == "Polygon" && <p>{_("Area:")} {this.props.model.areaDisplay}</p>}
         {featureType == "Polygon" && volume === null && !error && <p>{_("Volume:")} <i>{_("computing…")}</i> <i className="fa fa-cog fa-spin fa-fw" /></p>}
         {typeof volume === "number" ? 
             [
-              <p>{_("Volume:")} {volume.toFixed("2")} {_("Cubic Meters")} ({(volume * 35.3147).toFixed(2)} {_("Cubic Feet")})</p>,
+              <p>{_("Volume:")} {us.volume(volume).toString()}</p>,
               <p className="base-control">{_("Base surface:")} 
                 <select className="form-control" value={this.state.baseMethod} onChange={this.handleBaseMethodChange}>
                   {baseMethods.map(bm => 

@@ -207,6 +207,8 @@ class Metadata(TaskNestedView):
             for b in info['statistics']:
                 info['statistics'][b]['min'] = hrange[0]
                 info['statistics'][b]['max'] = hrange[1]
+                info['statistics'][b]['percentiles'][0] = max(hrange[0], info['statistics'][b]['percentiles'][0])
+                info['statistics'][b]['percentiles'][1] = min(hrange[1], info['statistics'][b]['percentiles'][1])
 
         cmap_labels = {
             "viridis": "Viridis",
@@ -397,7 +399,7 @@ class Tiles(TaskNestedView):
             # Hillshading is not a local tile operation and
             # requires neighbor tiles to be rendered seamlessly
             if hillshade is not None:
-                tile_buffer = tilesize
+                tile_buffer = 16
 
             try:
                 if expr is not None:
@@ -461,25 +463,25 @@ class Tiles(TaskNestedView):
                 if tile.data.shape[0] != 1:
                     raise exceptions.ValidationError(
                         _("Cannot compute hillshade of non-elevation raster (multiple bands found)"))
-                delta_scale = (maxzoom + ZOOM_EXTRA_LEVELS + 1 - z) * 4
+                delta_scale = (maxzoom + ZOOM_EXTRA_LEVELS + 1 - z) ** 2
                 dx = src.dataset.meta["transform"][0] * delta_scale
-                dy = -src.dataset.meta["transform"][4] * delta_scale
+                dy = src.dataset.meta["transform"][4] * delta_scale
                 ls = LightSource(azdeg=315, altdeg=45)
                 
                 # Remove elevation data from edge buffer tiles
                 # (to keep intensity uniform across tiles)
                 elevation = tile.data[0]
-                elevation[0:tilesize, 0:tilesize] = nodata
-                elevation[tilesize*2:tilesize*3, 0:tilesize] = nodata
-                elevation[0:tilesize, tilesize*2:tilesize*3] = nodata
-                elevation[tilesize*2:tilesize*3, tilesize*2:tilesize*3] = nodata
+                elevation[0:tile_buffer, 0:tile_buffer] = nodata
+                elevation[tile_buffer+tilesize:tile_buffer*2+tilesize, 0:tile_buffer] = nodata
+                elevation[0:tile_buffer, tile_buffer+tilesize:tile_buffer*2+tilesize] = nodata
+                elevation[tile_buffer+tilesize:tile_buffer*2+tilesize, tile_buffer+tilesize:tile_buffer*2+tilesize] = nodata
 
                 intensity = ls.hillshade(elevation, dx=dx, dy=dy, vert_exag=hillshade)
-                intensity = intensity[tilesize:tilesize * 2, tilesize:tilesize * 2]
+                intensity = intensity[tile_buffer:tile_buffer+tilesize, tile_buffer:tile_buffer+tilesize]
 
             if intensity is not None:
                 rgb = tile.post_process(in_range=(rescale_arr,))
-                rgb_data = rgb.data[:,tilesize:tilesize * 2, tilesize:tilesize * 2]
+                rgb_data = rgb.data[:,tile_buffer:tilesize+tile_buffer, tile_buffer:tilesize+tile_buffer]
                 if colormap:
                     rgb, _discard_ = apply_cmap(rgb_data, colormap.get(color_map))
                 if rgb.data.shape[0] != 3:
@@ -488,7 +490,7 @@ class Tiles(TaskNestedView):
                 intensity = intensity * 255.0
                 rgb = hsv_blend(rgb, intensity)
                 if rgb is not None:
-                    mask = tile.mask[tilesize:tilesize * 2, tilesize:tilesize * 2]
+                    mask = tile.mask[tile_buffer:tilesize+tile_buffer, tile_buffer:tilesize+tile_buffer]
                     return HttpResponse(
                         render(rgb, mask, img_format=driver, **options),
                         content_type="image/{}".format(ext)
@@ -522,6 +524,7 @@ class Export(TaskNestedView):
         epsg = request.data.get('epsg')
         color_map = request.data.get('color_map')
         hillshade = request.data.get('hillshade')
+        resample = request.data.get('resample', 0)
 
         if formula == '': formula = None
         if bands == '': bands = None
@@ -529,6 +532,7 @@ class Export(TaskNestedView):
         if epsg == '': epsg = None
         if color_map == '': color_map = None
         if hillshade == '': hillshade = None
+        if resample == '': resample = 0
 
         expr = None
 
@@ -549,6 +553,12 @@ class Export(TaskNestedView):
                 colormap.get(color_map)
             except InvalidColorMapName:
                 raise exceptions.ValidationError(_("Not a valid color_map value"))
+
+        if resample is not None:
+            try:
+                resample = float(resample)
+            except ValueError:
+                raise exceptions.ValidationError(_("Invalid resample value: %(value)s") % {'value': resample})
 
         if epsg is not None:
             try:
@@ -625,9 +635,10 @@ class Export(TaskNestedView):
                 return Response({'celery_task_id': celery_task_id, 'filename': filename})
         elif asset_type == 'georeferenced_model':
             # Shortcut the process if no processing is required
-            if export_format == 'laz' and (epsg == task.epsg or epsg is None):
+            if export_format == 'laz' and (epsg == task.epsg or epsg is None) and (resample is None or resample == 0):
                 return Response({'url': '/api/projects/{}/tasks/{}/download/{}.laz'.format(task.project.id, task.id, asset_type), 'filename': filename})
             else:
                 celery_task_id = export_pointcloud.delay(url, epsg=epsg, 
-                                                            format=export_format).task_id
+                                                            format=export_format,
+                                                            resample=resample).task_id
                 return Response({'celery_task_id': celery_task_id, 'filename': filename})

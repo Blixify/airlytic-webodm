@@ -51,10 +51,11 @@ class ImportTaskPanel extends React.Component {
           createImageThumbnails: false,
           previewTemplate: '<div style="display:none"></div>',
           clickable: this.uploadButton,
-          chunkSize: 2147483647,
           timeout: 2147483647,
           chunking: true,
-          chunkSize: 16000000, // 16MB
+          chunkSize: 16000000, // 16MB,
+          retryChunks: true,
+          retryChunksLimit: 20,
           headers: {
             [csrf.header]: csrf.token
           }
@@ -92,7 +93,7 @@ class ImportTaskPanel extends React.Component {
             }catch(e){
               this.setState({error: interpolate(_('Invalid response from server: %(error)s'), { error: e.message})});
             }
-          }else if (this.state.uploading){
+          }else{
             this.setState({uploading: false, error: _("An error occured while uploading the file. Please try again.")});
           }
         });
@@ -158,8 +159,8 @@ class ImportTaskPanel extends React.Component {
           <ErrorMessage bind={[this, 'error']} />
 
           <button type="button" className="close theme-color-primary" title="Close" onClick={this.cancel}><span aria-hidden="true">&times;</span></button>
-          <h4>{_("Import Existing Assets")}</h4>
-          <p><Trans params={{arrow: '<i class="glyphicon glyphicon-arrow-right"></i>'}}>{_("You can import .zip files that have been exported from existing tasks via Download Assets %(arrow)s All Assets.")}</Trans></p>
+          <h4>{_("Import Assets or Backups")}</h4>
+          <p><Trans params={{arrow: '<i class="glyphicon glyphicon-arrow-right"></i>'}}>{_("You can import .zip files that have been exported from existing tasks via Download Assets %(arrow)s All Assets | Backup.")}</Trans></p>
           
           <button disabled={this.state.uploading}
                   type="button" 

@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 import struct
+from datetime import datetime
 import uuid as uuid_module
 from app.vendor import zipfly
 
@@ -18,6 +19,7 @@ import rasterio
 from shutil import copyfile
 import requests
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = 4096000000
 from django.contrib.gis.gdal import GDALRaster
 from django.contrib.gis.gdal import OGRGeometry
 from django.contrib.gis.geos import GEOSGeometry
@@ -158,7 +160,7 @@ def resize_image(image_path, resize_to, done=None):
         os.rename(resized_image_path, image_path)
 
         logger.info("Resized {} to {}x{}".format(image_path, resized_width, resized_height))
-    except (IOError, ValueError, struct.error) as e:
+    except (IOError, ValueError, struct.error, Image.DecompressionBombError) as e:
         logger.warning("Cannot resize {}: {}.".format(image_path, str(e)))
         if done is not None:
             done()
@@ -259,6 +261,8 @@ class Task(models.Model):
     pending_action = models.IntegerField(choices=PENDING_ACTIONS, db_index=True, null=True, blank=True, help_text=_("A requested action to be performed on the task. The selected action will be performed by the worker at the next iteration."), verbose_name=_("Pending Action"))
 
     public = models.BooleanField(default=False, help_text=_("A flag indicating whether this task is available to the public"), verbose_name=_("Public"))
+    public_edit = models.BooleanField(default=False, help_text=_("A flag indicating whether this public task can be edited"), verbose_name=_("Public Edit"))
+
     resize_to = models.IntegerField(default=-1, help_text=_("When set to a value different than -1, indicates that the images for this task have been / will be resized to the size specified here before processing."), verbose_name=_("Resize To"))
 
     upload_progress = models.FloatField(default=0.0,
@@ -407,7 +411,15 @@ class Task(models.Model):
                 points = j.get('point_cloud_statistics', {}).get('stats', {}).get('statistic', [{}])[0].get('count')
             else:
                 points = j.get('reconstruction_statistics', {}).get('reconstructed_points_count')
-                        
+
+            spatial_refs = []
+            if j.get('reconstruction_statistics', {}).get('has_gps'):
+                spatial_refs.append("gps")
+            if j.get('reconstruction_statistics', {}).get('has_gcp') and 'average_error' in j.get('gcp_errors', {}):
+                spatial_refs.append("gcp")
+            if 'align' in j:
+                spatial_refs.append("alignment")
+
             return {
                 'pointcloud':{
                     'points': points,
@@ -416,6 +428,7 @@ class Task(models.Model):
                 'area': j.get('processing_statistics', {}).get('area'),
                 'start_date': j.get('processing_statistics', {}).get('start_date'),
                 'end_date': j.get('processing_statistics', {}).get('end_date'),
+                'spatial_refs': spatial_refs,
             }
         else:
             return {}
@@ -437,6 +450,9 @@ class Task(models.Model):
                     try:
                         # Try to use hard links first
                         shutil.copytree(self.task_path(), task.task_path(), copy_function=os.link)
+
+                        # Make sure the console output is not linked to the original task
+                        task.console.delink()
                     except Exception as e:
                         logger.warning("Cannot duplicate task using hard links, will use normal copy instead: {}".format(str(e)))
                         shutil.copytree(self.task_path(), task.task_path())
@@ -444,22 +460,68 @@ class Task(models.Model):
                     logger.warning("Task {} doesn't have folder, will skip copying".format(self))
 
                 self.project.owner.profile.clear_used_quota_cache()
+
+                from app.plugins import signals as plugin_signals
+                plugin_signals.task_duplicated.send_robust(sender=self.__class__, task_id=task.id)
+
             return task
         except Exception as e:
             logger.warning("Cannot duplicate task: {}".format(str(e)))
         
         return False
+
+    def write_backup_file(self):
+        """Dump this tasks's fields to a backup file"""
+        with open(self.data_path("backup.json"), "w") as f:
+            f.write(json.dumps({
+                'name': self.name,
+                'processing_time': self.processing_time,
+                'options': self.options,
+                'created_at': self.created_at.astimezone(timezone.utc).timestamp(),
+                'public': self.public,
+                'resize_to': self.resize_to,
+                'potree_scene': self.potree_scene,
+                'tags': self.tags
+            }))
     
-    def get_asset_file_or_zipstream(self, asset):
+    def read_backup_file(self):
+        """Set this tasks fields based on the backup file (but don't save)"""
+        backup_file = self.data_path("backup.json")
+        if os.path.isfile(backup_file):
+            try:
+                with open(backup_file, "r") as f:
+                    backup = json.loads(f.read())
+
+                    self.name = backup.get('name', self.name)
+                    self.processing_time = backup.get('processing_time', self.processing_time)
+                    self.options = backup.get('options', self.options)
+                    self.created_at = datetime.fromtimestamp(backup.get('created_at', self.created_at.astimezone(timezone.utc).timestamp()), tz=timezone.utc)
+                    self.public = backup.get('public', self.public)
+                    self.resize_to = backup.get('resize_to', self.resize_to)
+                    self.potree_scene = backup.get('potree_scene', self.potree_scene)
+                    self.tags = backup.get('tags', self.tags)
+
+            except Exception as e:
+                logger.warning("Cannot read backup file: %s" % str(e))
+
+    def get_task_backup_stream(self):
+        self.write_backup_file()
+        zip_dir = self.task_path("")
+        paths = [{'n': os.path.relpath(os.path.join(dp, f), zip_dir), 'fs': os.path.join(dp, f)} for dp, dn, filenames in os.walk(zip_dir) for f in filenames]
+        if len(paths) == 0:
+            raise FileNotFoundError("No files available for export")
+        return zipfly.ZipStream(paths)
+    
+    def get_asset_file_or_stream(self, asset):
         """
         Get a stream to an asset
         :param asset: one of ASSETS_MAP keys
-        :return: (path|stream, is_zipstream:bool)
+        :return: (path|stream)
         """
         if asset in self.ASSETS_MAP:
             value = self.ASSETS_MAP[asset]
             if isinstance(value, str):
-                return self.assets_path(value), False
+                return self.assets_path(value)
 
             elif isinstance(value, dict):
                 if 'deferred_path' in value and 'deferred_compress_dir' in value:
@@ -469,7 +531,7 @@ class Task(models.Model):
                         paths = [p for p in paths if os.path.basename(p['fs']) not in value['deferred_exclude_files']]
                     if len(paths) == 0:
                         raise FileNotFoundError("No files available for download")
-                    return zipfly.ZipStream(paths), True
+                    return zipfly.ZipStream(paths)
                 else:
                     raise FileNotFoundError("{} is not a valid asset (invalid dict values)".format(asset))
             else:
@@ -543,7 +605,7 @@ class Task(models.Model):
 
                             fd.write(chunk)
 
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ReadTimeoutError) as e:
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ReadTimeoutError, requests.exceptions.MissingSchema) as e:
                     raise NodeServerError(e)
 
         self.refresh_from_db()
@@ -552,7 +614,9 @@ class Task(models.Model):
             self.extract_assets_and_complete()
         except zipfile.BadZipFile:
             raise NodeServerError(gettext("Invalid zip file"))
-
+        except NotImplementedError:
+            raise NodeServerError(gettext("Unsupported compression method"))
+        
         images_json = self.assets_path("images.json")
         if os.path.exists(images_json):
             try:
@@ -564,7 +628,6 @@ class Task(models.Model):
                 pass
 
         self.pending_action = None
-        self.processing_time = 0
         self.save()
 
     def process(self):
@@ -855,9 +918,23 @@ class Task(models.Model):
             zip_h.extractall(assets_dir)
 
         logger.info("Extracted all.zip for {}".format(self))
-
-        # Remove zip
+        
         os.remove(zip_path)
+
+        # Check if this looks like a backup file, in which case we need to move the files
+        # a directory level higher
+        is_backup = os.path.isfile(self.assets_path("data", "backup.json")) and os.path.isdir(self.assets_path("assets"))
+        if is_backup:
+            logger.info("Restoring from backup")
+            try:
+                tmp_dir = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, f"{self.id}.backup")
+                
+                shutil.move(assets_dir, tmp_dir)
+                shutil.rmtree(self.task_path(""))
+                shutil.move(tmp_dir, self.task_path(""))
+            except shutil.Error as e:
+                logger.warning("Cannot restore from backup: %s" % str(e))
+                raise NodeServerError("Cannot restore from backup")
 
         # Populate *_extent fields
         extent_fields = [
@@ -900,8 +977,14 @@ class Task(models.Model):
         self.update_size()
         self.potree_scene = {}
         self.running_progress = 1.0
-        self.console += gettext("Done!") + "\n"
         self.status = status_codes.COMPLETED
+
+        if is_backup:
+            self.read_backup_file()
+            self.import_url = ""
+        else:
+            self.console += gettext("Done!") + "\n"
+        
         self.save()
 
         from app.plugins import signals as plugin_signals
@@ -936,8 +1019,10 @@ class Task(models.Model):
             'meta': {
                 'task': {
                     'id': str(self.id),
+                    'name': self.name,
                     'project': self.project.id,
                     'public': self.public,
+                    'public_edit': self.public_edit,
                     'camera_shots': camera_shots,
                     'ground_control_points': ground_control_points,
                     'epsg': self.epsg,
@@ -955,6 +1040,7 @@ class Task(models.Model):
             'project': self.project.id,
             'available_assets': self.available_assets,
             'public': self.public,
+            'public_edit': self.public_edit,
             'epsg': self.epsg
         }
 
@@ -1084,6 +1170,9 @@ class Task(models.Model):
         if self.resize_to < 0:
             logger.warning("We were asked to resize images to {}, this might be an error.".format(self.resize_to))
             return []
+        # Add a signal to notify that we are resizing images
+        from app.plugins import signals as plugin_signals
+        plugin_signals.task_resizing_images.send_robust(sender=self.__class__, task_id=self.id)
 
         images_path = self.find_all_files_matching(r'.*\.(jpe?g|tiff?)$')
         total_images = len(images_path)
@@ -1161,8 +1250,33 @@ class Task(models.Model):
     def get_image_path(self, filename):
         p = self.task_path(filename)
         return path_traversal_check(p, self.task_path())
+
+    def set_alignment_file_from(self, align_task):
+        tp = self.task_path()
+        if not os.path.exists(tp):
+            os.makedirs(tp, exist_ok=True)
+
+        alignment_file = align_task.assets_path(self.ASSETS_MAP['georeferenced_model.laz'])
+        dst_file = self.task_path("align.laz")
+
+        if os.path.exists(dst_file):
+            os.unlink(dst_file)
+
+        if os.path.exists(alignment_file):
+            try:
+                os.link(alignment_file, dst_file)
+            except:
+                shutil.copy(alignment_file, dst_file)
+        else:
+            logger.warn("Cannot set alignment file for {}, {} does not exist".format(self, alignment_file))
     
+    def get_check_file_asset_path(self, asset):
+        file = self.assets_path(self.ASSETS_MAP[asset])
+        if isinstance(file, str) and os.path.isfile(file):
+            return file
+
     def handle_images_upload(self, files):
+        uploaded = {}
         for file in files:
             name = file.name
             if name is None:
@@ -1181,6 +1295,9 @@ class Task(models.Model):
                 else:
                     with open(file.temporary_file_path(), 'rb') as f:
                         shutil.copyfileobj(f, fd)
+            
+            uploaded[name] = os.path.getsize(dst_path)
+        return uploaded
 
     def update_size(self, commit=False):
         try:
