@@ -4,6 +4,7 @@ import update from 'immutability-helper';
 import TaskList from './TaskList';
 import NewTaskPanel from './NewTaskPanel';
 import ImportTaskPanel from './ImportTaskPanel';
+import ImportExternalPanel from './ImportExternalPanel';
 import UploadProgressBar from './UploadProgressBar';
 import ErrorMessage from './ErrorMessage';
 import EditProjectDialog from './EditProjectDialog';
@@ -39,7 +40,9 @@ class ProjectListItem extends React.Component {
       data: props.data,
       refreshing: false,
       importing: false,
+      importingExternal: false,
       buttons: [],
+      importItems: [],
       sortKey: "-created_at",
       filterTags: [],
       selectedTags: [],
@@ -138,15 +141,18 @@ class ProjectListItem extends React.Component {
       this.dz = new Dropzone(this.dropzone, {
           paramName: "images",
           url : 'TO_BE_CHANGED',
-          parallelUploads: 6,
+          parallelUploads: 4,
           uploadMultiple: false,
-          acceptedFiles: "image/*,text/plain,.las,.laz,video/*,.srt",
+          acceptedFiles: "image/*,text/plain,.las,.laz,video/*,.srt,.dng,.nef",
           autoProcessQueue: false,
           createImageThumbnails: false,
           clickable: this.uploadButton,
           maxFilesize: 131072, // 128G
-          chunkSize: 2147483647,
           timeout: 2147483647,
+          chunking: true,
+          chunkSize: 8000000, // 8MB,
+          retryChunks: true,
+          retryChunksLimit: 20,
           
           headers: {
             [csrf.header]: csrf.token
@@ -224,6 +230,10 @@ class ProjectListItem extends React.Component {
             const retry = () => {
                 const MAX_RETRIES = 20;
 
+                if (!file.accepted){
+                  throw new Error(interpolate(_('%(filename)s is not a valid file'), {filename: file.name }));
+                }
+
                 if (file.retries < MAX_RETRIES){
                     // Update progress
                     const totalBytesSent = this.state.upload.totalBytesSent - file.trackedBytesSent;
@@ -260,7 +270,8 @@ class ProjectListItem extends React.Component {
                 }else{
                     // Check response
                     let response = JSON.parse(file.xhr.response);
-                    if (response.success && response.uploaded && response.uploaded[file.upload.filename] === file.size){
+                    if (response.success){
+                      if (response.uploaded && response.uploaded[file.upload.filename] === file.size){
                         // Update progress by removing the tracked progress and 
                         // use the file size as the true number of bytes
                         let totalBytesSent = this.state.upload.totalBytesSent + file.size;
@@ -273,8 +284,11 @@ class ProjectListItem extends React.Component {
                             totalBytesSent,
                             uploadedCount: this.state.upload.uploadedCount + 1
                         });
+                      }else{
+                        // Chunk success, wait for end
+                      }
 
-                        this.dz.processQueue();
+                      this.dz.processQueue();
                     }else{
                         retry();
                     }
@@ -294,22 +308,40 @@ class ProjectListItem extends React.Component {
             const remainingFilesCount = this.state.upload.totalCount - this.state.upload.uploadedCount;
             if (remainingFilesCount === 0 && this.state.upload.uploadedCount > 0){
                 // All files have uploaded!
-                this.setUploadState({uploading: false});
+                const COMMIT_RETRIES = 10;
 
-                $.ajax({
-                    url: `/api/projects/${this.state.data.id}/tasks/${this.dz._taskInfo.id}/commit/`,
-                    contentType: 'application/json',
-                    dataType: 'json',
-                    type: 'POST'
-                  }).done((task) => {
-                    if (task && task.id){
-                        this.newTaskAdded();
+                const commitUploads = (attempt) => {
+                  const retryCommit = () => {
+                    if (attempt < COMMIT_RETRIES){
+                      console.warn(`Commit failed, retrying... (${attempt})`);
+                      setTimeout(() => {
+                        if (this.state.upload.uploading){
+                          commitUploads(attempt + 1);
+                        }
+                      }, 5000 * attempt);
                     }else{
-                        this.setUploadState({error: interpolate(_('Cannot create new task. Invalid response from server: %(error)s'), { error: JSON.stringify(task) }) });
+                      this.setUploadState({uploading: false, error: _("Cannot create new task. Please try again later.")});
                     }
-                  }).fail(() => {
-                    this.setUploadState({error: _("Cannot create new task. Please try again later.")});
-                  });
+                  };
+
+                  $.ajax({
+                      url: `/api/projects/${this.state.data.id}/tasks/${this.dz._taskInfo.id}/commit/`,
+                      contentType: 'application/json',
+                      dataType: 'json',
+                      type: 'POST',
+                      timeout: 30000,
+                    }).done((task) => {
+                      if (task && task.id){
+                          this.setUploadState({uploading: false});
+                          this.newTaskAdded();
+                      }else{
+                        retryCommit();
+                      }
+                    }).fail(() => {
+                      retryCommit();
+                    });
+                };
+                commitUploads(0);
             }else if (this.dz.getQueuedFiles() === 0){
                 // Done but didn't upload all?
                 this.setUploadState({
@@ -335,10 +367,18 @@ class ProjectListItem extends React.Component {
             buttons: {$push: [button]}
         }));
     });
+
+    PluginsAPI.Dashboard.triggerAddImportTaskItem({projectId: this.state.data.id, onNewTaskAdded: this.newTaskAdded}, (item) => {
+        if (!item) return;
+
+        this.setState(update(this.state, {
+            importItems: {$push: [item]}
+        }));
+    });
   }
 
   newTaskAdded = () => {
-    this.setState({importing: false});
+    this.setState({importing: false, importingExternal: false});
     
     if (this.state.showTaskList){
       this.taskList.refresh();
@@ -499,12 +539,21 @@ class ProjectListItem extends React.Component {
   }
 
   handleImportTask = () => {
-    this.setState({importing: true});
+    this.setState({importing: true, importingExternal: false});
   }
 
   handleCancelImportTask = () => {
     this.setState({importing: false});
   }
+
+  handleImportExternal = () => {
+    this.setState({importingExternal: true, importing: false});
+  }
+
+  handleCancelImportExternal = () => {
+    this.setState({importingExternal: false});
+  }
+  
 
   handleTaskTitleHint = (hasGPSCallback) => {
       return new Promise((resolve, reject) => {
@@ -666,10 +715,17 @@ class ProjectListItem extends React.Component {
                   <span className="hidden-xs">{_("Select Images and GCP")}</span>
                 </button>
                 <button type="button" 
-                      className="btn btn-default btn-sm"
-                      onClick={this.handleImportTask}>
-                  <i className="glyphicon glyphicon-import"></i> <span className="hidden-xs">{_("Import")}</span>
+                      className="btn btn-default btn-sm btn-import"
+                      data-toggle="dropdown">
+                  <i className="glyphicon glyphicon-import"></i> <span className="hidden-xs">{_("Import")}</span> <span className="caret hidden-xs"></span>
                 </button>
+                <ul className="dropdown-menu import-dropdown">
+                  <li><a href="javascript:void(0)" onClick={this.handleImportTask}><i className={"far fa-file-archive fa-fw"}></i> {_("Assets / Backups")}</a></li>
+                  <li><a href="javascript:void(0)" onClick={this.handleImportExternal}><i className={"fa fa-cloud-upload-alt fa-fw"}></i> {_("External Data")}</a></li>
+                  {this.state.importItems.length ? 
+                    this.state.importItems.map((item, i) => <React.Fragment key={i}>{item}</React.Fragment>)
+                  : ""}
+                </ul>
                 {this.state.buttons.map((button, i) => <React.Fragment key={i}>{button}</React.Fragment>)}
               </div>
             : ""}
@@ -791,6 +847,14 @@ class ProjectListItem extends React.Component {
             <ImportTaskPanel
               onImported={this.newTaskAdded}
               onCancel={this.handleCancelImportTask}
+              projectId={this.state.data.id}
+            />
+          : ""}
+
+          {this.state.importingExternal ? 
+            <ImportExternalPanel
+              onImported={this.newTaskAdded}
+              onCancel={this.handleCancelImportExternal}
               projectId={this.state.data.id}
             />
           : ""}

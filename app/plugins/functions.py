@@ -92,7 +92,10 @@ def build_plugins():
                 npm = "npm"
                 if platform.system() == "Windows":
                     npm = "npm.cmd"
-                subprocess.call([npm, 'install'], cwd=plugin.get_path("public"))
+                command = [npm, 'install']
+                if plugin.is_persistent():
+                    command.append('--ignore-scripts')
+                subprocess.call(command, cwd=plugin.get_path("public"))
             except FileNotFoundError:
                 logger.warn("npm is not installed, will skip this plugin")
                 continue
@@ -327,11 +330,22 @@ def get_dynamic_script_handler(script_path, callback=None, **kwargs):
 def enable_plugin(plugin_name):
     p = get_plugin_by_name(plugin_name, only_active=False)
     p.register()
+    try:
+        p.enable()
+    except Exception as e:
+        logger.warning(f"Plugin: {plugin_name} enable error: {str(e)}")
+        raise  # Propagate error to UI
     Plugin.objects.get(pk=plugin_name).enable()
     return p
 
 def disable_plugin(plugin_name):
     p = get_plugin_by_name(plugin_name, only_active=False)
+    try:
+        p.disable()
+    except Exception as e:
+        logger.warning(f"Plugin: {plugin_name} disable error: {str(e)}")
+        Plugin.objects.get(pk=plugin_name).disable()
+        raise # Propagate error to UI
     Plugin.objects.get(pk=plugin_name).disable()
     return p
 

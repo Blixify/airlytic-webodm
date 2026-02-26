@@ -25,11 +25,14 @@ from .hsvblend import hsv_blend
 from .hillshade import LightSource
 from .formulas import lookup_formula, get_algorithm_list, get_auto_bands
 from .tasks import TaskNestedView
+from app.geoutils import geom_transform_wkt_bbox, get_rasterio_to_meters_factor
 from rest_framework import exceptions
 from rest_framework.response import Response
 from worker.tasks import export_raster, export_pointcloud
 from django.utils.translation import gettext as _
 import warnings
+from functools import lru_cache
+from osgeo import osr
 
 # Disable: NotGeoreferencedWarning: Dataset has no geotransform, gcps, or rpcs. The identity matrix be returned.
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
@@ -37,10 +40,28 @@ warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 # Disable: Alpha band was removed from the output data array
 warnings.filterwarnings("ignore", category=AlphaBandWarning)
 
+# Disable: UserWarning: Warning: 'partition' will ignore the 'mask' of the MaskedArray.
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Disable: RuntimeWarning: overflow encountered in reduce
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 for custom_colormap in custom_colormaps:
     colormap = colormap.register(custom_colormap)
 
+@lru_cache(maxsize=128)
+def get_colormap_encoded_values(cmap):
+    values = colormap.get(cmap).values()
+    # values = [[R, G, B, A], [R, G, B, A], ...]
+    encoded_values = []
+    for rgba in values:
+        # Pack R, G, B, A (each 0-255) into a 32-bit integer
+        # Format: 0xRRGGBBAA (R in most significant byte)
+        encoded = (rgba[0] << 24) | (rgba[1] << 16) | (rgba[2] << 8) | rgba[3]
+        encoded_values.append(encoded)
 
+    return encoded_values
+    
 def get_zoom_safe(src_dst):
     minzoom, maxzoom = src_dst.spatial_info["minzoom"], src_dst.spatial_info["maxzoom"]
     if maxzoom < minzoom:
@@ -134,6 +155,7 @@ class Metadata(TaskNestedView):
         formula = self.request.query_params.get('formula')
         bands = self.request.query_params.get('bands')
         defined_range = self.request.query_params.get('range')
+        crop = self.request.query_params.get('crop') == '1'
         boundaries_feature = self.request.query_params.get('boundaries')
         if formula == '': formula = None
         if bands == '': bands = None
@@ -163,15 +185,38 @@ class Metadata(TaskNestedView):
         raster_path = get_raster_path(task, tile_type)
         if not os.path.isfile(raster_path):
             raise exceptions.NotFound()
+
+        to_meter = 1.0
         try:
             with COGReader(raster_path) as src:
+
                 band_count = src.dataset.meta['count']
                 if boundaries_feature is not None:
-                    boundaries_cutline = create_cutline(src.dataset, boundaries_feature, CRS.from_string('EPSG:4326'))
-                    boundaries_bbox = featureBounds(boundaries_feature)
+                    cutline = create_cutline(src.dataset, boundaries_feature, CRS.from_string('EPSG:4326'))
+                    bounds = featureBounds(boundaries_feature)
+                elif crop and task.crop is not None:
+                    cutline, bounds = geom_transform_wkt_bbox(task.crop, src.dataset)
                 else:
-                    boundaries_cutline = None
-                    boundaries_bbox = None
+                    cutline = None
+                    bounds = None
+                
+                if cutline is not None:
+                    vrt_options = {'cutline': cutline}
+                else:
+                    vrt_options = None
+
+                if tile_type in ['dsm', 'dtm']:
+                    to_meter = get_rasterio_to_meters_factor(src.dataset)
+                    
+                    # WarpedVRT is really slow with compound CRSes
+                    # so we override the CRS to the 2D version for speed
+                    # in case there's one
+                    if vrt_options is None:
+                        vrt_options = {}
+
+                    if task.epsg is not None:
+                        vrt_options['src_crs'] = f"EPSG:{task.epsg}"
+
                 if has_alpha_band(src.dataset):
                     band_count -= 1
                 nodata = None
@@ -180,10 +225,7 @@ class Metadata(TaskNestedView):
                     nodata = 0
                 histogram_options = {"bins": 255, "range": hrange}
                 if expr is not None:
-                    if boundaries_cutline is not None:
-                        data, mask = src.preview(expression=expr, vrt_options={'cutline': boundaries_cutline})
-                    else:
-                        data, mask = src.preview(expression=expr)
+                    data, mask = src.preview(expression=expr, vrt_options=vrt_options)
                     data = np.ma.array(data)
                     data.mask = mask == 0
                     stats = {
@@ -193,14 +235,18 @@ class Metadata(TaskNestedView):
                     stats = {b: ImageStatistics(**s) for b, s in stats.items()}
                     metadata = RioMetadata(statistics=stats, **src.info().dict())
                 else:
-                    if (boundaries_cutline is not None) and (boundaries_bbox is not None):
-                        metadata = src.metadata(pmin=pmin, pmax=pmax, hist_options=histogram_options, nodata=nodata
-                                                , bounds=boundaries_bbox, vrt_options={'cutline': boundaries_cutline})
-                    else:
-                        metadata = src.metadata(pmin=pmin, pmax=pmax, hist_options=histogram_options, nodata=nodata)
+                    metadata = src.metadata(pmin=pmin, pmax=pmax, hist_options=histogram_options, nodata=nodata,
+                                            bounds=bounds, vrt_options=vrt_options)
                 info = json.loads(metadata.json())
         except IndexError as e:
             # Caught when trying to get an invalid raster metadata
+            # or when the crop area is defined improperly. In order
+            # to avoid locking the user out of the map, we remove cropping
+            # if this ever happens.
+            if task.crop is not None:
+                task.crop = None
+                task.save()
+            
             raise exceptions.ValidationError("Cannot retrieve raster metadata: %s" % str(e))
         # Override min/max
         if hrange:
@@ -248,13 +294,22 @@ class Metadata(TaskNestedView):
         info['color_maps'] = []
         info['algorithms'] = algorithms
         info['auto_bands'] = auto_bands
+
+        if to_meter != 1.0:
+            for b in info['statistics']:
+                info['statistics'][b]['min'] *= to_meter
+                info['statistics'][b]['max'] *= to_meter
+                info['statistics'][b]['std'] *= to_meter
+                info['statistics'][b]['percentiles'][0] *= to_meter
+                info['statistics'][b]['percentiles'][1] *= to_meter
+                info['statistics'][b]['histogram'][1] = [n * to_meter for n in info['statistics'][b]['histogram'][1]]
         
         if colormaps:
             for cmap in colormaps:
                 try:
                     info['color_maps'].append({
                         'key': cmap,
-                        'color_map': colormap.get(cmap).values(),
+                        'color_map': get_colormap_encoded_values(cmap),
                         'label': cmap_labels.get(cmap, cmap)
                     })
                 except FileNotFoundError:
@@ -268,7 +323,8 @@ class Metadata(TaskNestedView):
             info['maxzoom'] = info['minzoom']
         info['maxzoom'] += ZOOM_EXTRA_LEVELS
         info['minzoom'] -= ZOOM_EXTRA_LEVELS
-        info['bounds'] = {'value': src.bounds, 'crs': src.dataset.crs}
+        info['bounds'] = {'value': bounds if bounds is not None else src.bounds, 
+                          'crs': f"EPSG:{task.epsg}" if task.epsg is not None else task.wkt}
 
         return Response(info)
 
@@ -296,6 +352,7 @@ class Tiles(TaskNestedView):
         color_map = self.request.query_params.get('color_map')
         hillshade = self.request.query_params.get('hillshade')
         tilesize = self.request.query_params.get('size')
+        crop = self.request.query_params.get('crop') == '1'
 
         boundaries_feature = self.request.query_params.get('boundaries')
         if boundaries_feature == '':
@@ -351,6 +408,7 @@ class Tiles(TaskNestedView):
         if not os.path.isfile(url):
             raise exceptions.NotFound()
 
+        to_meter = 1.0
         with COGReader(url) as src:
             if not src.tile_exists(z, x, y):
                 raise exceptions.NotFound(_("Outside of bounds"))
@@ -359,13 +417,25 @@ class Tiles(TaskNestedView):
             has_alpha = has_alpha_band(src.dataset)
             if z < minzoom - ZOOM_EXTRA_LEVELS or z > maxzoom + ZOOM_EXTRA_LEVELS:
                 raise exceptions.NotFound()
+
             if boundaries_feature is not None:
                 try:
-                    boundaries_cutline = create_cutline(src.dataset, boundaries_feature, CRS.from_string('EPSG:4326'))
+                    cutline = create_cutline(src.dataset, boundaries_feature, CRS.from_string('EPSG:4326'))
                 except:
                     raise exceptions.ValidationError(_("Invalid boundaries"))
+            elif crop and task.crop is not None:
+                cutline, bounds = geom_transform_wkt_bbox(task.crop, src.dataset)
             else:
-                boundaries_cutline = None
+                cutline = None
+            
+            if cutline is not None:
+                vrt_options = {'cutline': cutline}
+            else:
+                vrt_options = None
+
+            if tile_type in ['dsm', 'dtm']:
+                to_meter = get_rasterio_to_meters_factor(src.dataset)
+
             # Handle N-bands datasets for orthophotos (not plant health)
             if tile_type == 'orthophoto' and expr is None:
                 ci = src.dataset.colorinterp
@@ -396,6 +466,15 @@ class Tiles(TaskNestedView):
                 resampling = "bilinear"
                 padding = 16
 
+                # WarpedVRT is really slow with compound CRSes
+                # so we override the CRS to the 2D version for speed
+                # in case there's one
+                if vrt_options is None:
+                    vrt_options = {}
+
+                if task.epsg is not None:
+                    vrt_options['src_crs'] = f"EPSG:{task.epsg}"
+
             # Hillshading is not a local tile operation and
             # requires neighbor tiles to be rendered seamlessly
             if hillshade is not None:
@@ -403,27 +482,15 @@ class Tiles(TaskNestedView):
 
             try:
                 if expr is not None:
-                    if boundaries_cutline is not None:
-                        tile = src.tile(x, y, z, expression=expr, tilesize=tilesize, nodata=nodata,
-                                        padding=padding,
-                                        tile_buffer=tile_buffer,
-                                        resampling_method=resampling, vrt_options={'cutline': boundaries_cutline})
-                    else:
-                        tile = src.tile(x, y, z, expression=expr, tilesize=tilesize, nodata=nodata,
-                                        padding=padding,
-                                        tile_buffer=tile_buffer,
-                                        resampling_method=resampling)
+                    tile = src.tile(x, y, z, expression=expr, tilesize=tilesize, nodata=nodata,
+                                    padding=padding,
+                                    tile_buffer=tile_buffer,
+                                    resampling_method=resampling, vrt_options=vrt_options)
                 else:
-                    if boundaries_cutline is not None:
-                        tile = src.tile(x, y, z, tilesize=tilesize, nodata=nodata,
-                                        padding=padding,
-                                        tile_buffer=tile_buffer,
-                                        resampling_method=resampling, vrt_options={'cutline': boundaries_cutline})
-                    else:
-                        tile = src.tile(x, y, z, indexes=indexes, tilesize=tilesize, nodata=nodata,
-                                        padding=padding, 
-                                        tile_buffer=tile_buffer,
-                                        resampling_method=resampling)
+                    tile = src.tile(x, y, z, indexes=indexes, tilesize=tilesize, nodata=nodata,
+                                    padding=padding,
+                                    tile_buffer=tile_buffer,
+                                    resampling_method=resampling, vrt_options=vrt_options)
             except TileOutsideBounds:
                 raise exceptions.NotFound(_("Outside of bounds"))
             
@@ -436,6 +503,8 @@ class Tiles(TaskNestedView):
             intensity = None
             try:
                 rescale_arr = list(map(float, rescale.split(",")))
+                if tile_type in ['dsm', 'dtm']:
+                    rescale_arr = [v / to_meter for v in rescale_arr]
             except ValueError:
                 raise exceptions.ValidationError(_("Invalid rescale value"))
 
@@ -522,6 +591,7 @@ class Export(TaskNestedView):
         rescale = request.data.get('rescale')
         export_format = request.data.get('format', 'laz' if asset_type == 'georeferenced_model' else 'gtiff')
         epsg = request.data.get('epsg')
+        proj = request.data.get('proj')
         color_map = request.data.get('color_map')
         hillshade = request.data.get('hillshade')
         resample = request.data.get('resample', 0)
@@ -530,9 +600,13 @@ class Export(TaskNestedView):
         if bands == '': bands = None
         if rescale == '': rescale = None
         if epsg == '': epsg = None
+        if proj == '': proj = None
         if color_map == '': color_map = None
         if hillshade == '': hillshade = None
         if resample == '': resample = 0
+
+        if epsg is not None:
+            proj = None
 
         expr = None
 
@@ -566,6 +640,14 @@ class Export(TaskNestedView):
             except ValueError:
                 raise exceptions.ValidationError(_("Invalid EPSG code: %(value)s") % {'value': epsg})
         
+        if proj is not None:
+            try:
+                srs = osr.SpatialReference()
+                if srs.ImportFromProj4(proj) != 0:
+                    raise exceptions.ValidationError(_("Invalid PROJ string: %(value)s") % {'value': proj})
+            except Exception as e:
+                raise exceptions.ValidationError(_("Invalid PROJ string: %(value)s") % {'value': proj})
+
         if (formula and not bands) or (not formula and bands):
             raise exceptions.ValidationError(_("Both formula and bands parameters are required"))
 
@@ -608,7 +690,7 @@ class Export(TaskNestedView):
         if not os.path.isfile(url):
             raise exceptions.NotFound()
 
-        if epsg is not None and task.epsg is None:
+        if epsg is not None and (task.epsg is None and task.wkt is None):
             raise exceptions.ValidationError(_("Cannot use epsg on non-georeferenced dataset"))
         
         # Strip unsafe chars, append suffix
@@ -621,24 +703,29 @@ class Export(TaskNestedView):
 
         if asset_type in ['orthophoto', 'dsm', 'dtm']:
             # Shortcut the process if no processing is required
-            if export_format == 'gtiff' and (epsg == task.epsg or epsg is None) and expr is None:
+            if export_format == 'gtiff' and ((task.epsg is not None and epsg == task.epsg) or epsg is None) and (proj is None) and expr is None and task.crop is None:
                 return Response({'url': '/api/projects/{}/tasks/{}/download/{}.tif'.format(task.project.id, task.id, asset_type), 'filename': filename})
             else:
-                celery_task_id = export_raster.delay(url, epsg=epsg, 
+                celery_task_id = export_raster.delay(url, epsg=epsg,
+                                                        proj=proj, 
                                                         expression=expr, 
                                                         format=export_format, 
                                                         rescale=rescale, 
                                                         color_map=color_map,
                                                         hillshade=hillshade,
                                                         asset_type=asset_type,
-                                                        name=task.name).task_id
+                                                        name=task.name,
+                                                        crop=task.crop.wkt if task.crop is not None else None).task_id
                 return Response({'celery_task_id': celery_task_id, 'filename': filename})
         elif asset_type == 'georeferenced_model':
             # Shortcut the process if no processing is required
-            if export_format == 'laz' and (epsg == task.epsg or epsg is None) and (resample is None or resample == 0):
+            if export_format == 'laz' and ((task.epsg is not None and epsg == task.epsg) or epsg is None) and (proj is None) and (resample is None or resample == 0) and task.crop is None:
                 return Response({'url': '/api/projects/{}/tasks/{}/download/{}.laz'.format(task.project.id, task.id, asset_type), 'filename': filename})
             else:
-                celery_task_id = export_pointcloud.delay(url, epsg=epsg, 
+                celery_task_id = export_pointcloud.delay(url, epsg=epsg,
+                                                            proj=proj, 
                                                             format=export_format,
-                                                            resample=resample).task_id
+                                                            resample=resample,
+                                                            crop=task.crop.wkt if task.crop is not None else None,
+                                                            crop_reference=task.get_reference_raster() if task.crop is not None else None).task_id
                 return Response({'celery_task_id': celery_task_id, 'filename': filename})

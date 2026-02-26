@@ -15,7 +15,7 @@ def task_options_docs_link():
 
 @register.simple_tag
 def gcp_docs_link():
-    return '<a href="%s" target="_blank">' % settings.GCP_DOCS_LINK
+    return settings.GCP_DOCS_LINK
 
 @register.simple_tag
 def reset_password_link():
@@ -120,7 +120,7 @@ def theme(context, color):
         return getattr(context['SETTINGS'].theme, color)
     except Exception as e:
         logger.warning("Cannot load configuration from theme(): " + str(e))
-        return "blue" # dah buh dih ah buh daa..
+        return "#0000FF" # dah buh dih ah buh daa..
 
 @register.simple_tag
 def complementary(hexcolor):

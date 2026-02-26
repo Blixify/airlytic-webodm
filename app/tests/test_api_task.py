@@ -3,6 +3,7 @@ import os
 import time
 
 import threading
+import rasterio
 
 from worker.celery import app as celery
 import logging
@@ -23,12 +24,14 @@ from app import pending_actions
 from app.api.formulas import algos, get_camera_filters_for
 from app.api.tiler import ZOOM_EXTRA_LEVELS
 from app.cogeo import valid_cogeo
+from app.geoutils import get_rasterio_to_meters_factor
 from app.models import Project, Task
 from app.models.task import task_directory_path, full_task_directory_path, TaskInterruptedException
 from app.plugins.signals import task_completed, task_removed, task_removing
 from app.tests.classes import BootTransactionTestCase
 from nodeodm import status_codes
 from nodeodm.models import ProcessingNode
+from guardian.shortcuts import assign_perm
 from app.testwatch import testWatch
 from .utils import start_processing_node, clear_test_media_root, catch_signal
 
@@ -37,6 +40,7 @@ from .utils import start_processing_node, clear_test_media_root, catch_signal
 # do not commit changes to the DB, so spawning a new thread will show no
 # data in it.
 from webodm import settings
+import subprocess
 logger = logging.getLogger('app.logger')
 
 DELAY = 2  # time to sleep for during process launch, background processing, etc.
@@ -71,7 +75,9 @@ class TestApiTask(BootTransactionTestCase):
 
             # Create processing node
             pnode = ProcessingNode.objects.create(hostname="localhost", port=11223)
-
+            assign_perm('view_processingnode', user, pnode)
+            assign_perm('view_processingnode', other_user, pnode)
+            
             # Verify that it's working
             self.assertTrue(pnode.api_version is not None)
 
@@ -80,8 +86,37 @@ class TestApiTask(BootTransactionTestCase):
             image2 = open("app/fixtures/tiny_drone_image_2.jpg", 'rb')
             multispec_image = open("app/fixtures/tiny_drone_image_multispec.tif", 'rb')
 
-
             img1 = Image.open("app/fixtures/tiny_drone_image.jpg")
+            ms_img = Image.open("app/fixtures/tiny_drone_image_multispec.tif")
+
+            img1_exif = img1.getexif().tobytes()
+            img1_xmp = img1.info.get('xmp')
+            self.assertTrue(img1_xmp is not None)
+
+            # Check EXIF/XMP
+
+            def extract_exif(file):
+                return subprocess.run(['exiftool', file], 
+                        capture_output=True, text=True, check=True).stdout.strip()
+            def extract_xmp(file):
+                return subprocess.run(['exiftool', '-xmp', '-b', file], 
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+
+            img1_exif_dump = extract_exif('app/fixtures/tiny_drone_image.jpg')
+            self.assertTrue('''GPS Latitude                    : 41 deg 13' 34.93" N''' in img1_exif_dump)
+            
+            img1_xmp_dump = extract_xmp('app/fixtures/tiny_drone_image.jpg')
+            self.assertTrue('<sensefly:CamID>11</sensefly:CamID>' in img1_xmp_dump)
+            
+            # EXIF/XMP from multispec image
+
+            ms_exif = extract_exif('app/fixtures/tiny_drone_image_multispec.tif')
+            self.assertTrue('''GPS Latitude                    : 50 deg 58' 53.02" N''' in ms_exif)
+            
+            ms_xmp = extract_xmp('app/fixtures/tiny_drone_image_multispec.tif')
+            self.assertTrue('MicaSense:CaptureId="CqaClXcmhKgplT0yPCLE"' in ms_xmp)
+            
 
             # Not authenticated?
             res = client.post("/api/projects/{}/tasks/".format(project.id), {
@@ -147,15 +182,39 @@ class TestApiTask(BootTransactionTestCase):
             image1.seek(0)
             image2.seek(0)
             gcp.seek(0)
-            multispec_image.seek(0)
 
             # Uploaded images should have been resized
             with Image.open(resized_task.task_path("tiny_drone_image.jpg")) as im:
-                self.assertTrue(im.size[0] == img1.size[0] / 2.0)
+                self.assertEqual(im.size[0], img1.size[0] / 2.0)
 
-            # Except the multispectral image
+                # Xmp and exif are preserved
+                self.assertTrue(im.info.get('xmp') is not None)
+                self.assertEqual(im.info.get('xmp'), img1_xmp)
+                self.assertTrue(im.info.get('exif') is not None)
+                self.assertEqual(im.getexif().tobytes(), img1_exif)
+
+                # Exiftool agrees
+                resized_exif_dump = extract_exif(resized_task.task_path("tiny_drone_image.jpg"))
+                self.assertTrue('''GPS Latitude                    : 41 deg 13' 34.93" N''' in resized_exif_dump)
+                
+                resized_xmp_dump = extract_xmp(resized_task.task_path("tiny_drone_image.jpg"))
+                self.assertTrue('<sensefly:CamID>11</sensefly:CamID>' in resized_xmp_dump)
+                
+
+            # Including the multispectral image
+            # which has invalid exif data
             with Image.open(resized_task.task_path("tiny_drone_image_multispec.tif")) as im:
-                self.assertTrue(im.size[0] == img1.size[0])
+                self.assertEqual(im.size[0], img1.size[0] / 2.0)
+
+            # EXIF/XMP bytes are preserved
+            ms_resized_exif = subprocess.run(['exiftool', resized_task.task_path("tiny_drone_image_multispec.tif")], 
+                        capture_output=True, text=True, check=True).stdout.strip()
+            self.assertTrue('''GPS Latitude                    : 50 deg 58' 53.02" N''' in ms_resized_exif)
+
+            ms_resized_xmp = subprocess.run(['exiftool', '-xmp', '-b', resized_task.task_path("tiny_drone_image_multispec.tif")], 
+                        capture_output=True, text=True, check=True).stdout.strip()
+            self.assertTrue('MicaSense:CaptureId="CqaClXcmhKgplT0yPCLE"' in ms_resized_xmp)
+            
 
             # GCP should have been scaled
             with open(resized_task.task_path("gcp.txt")) as f:
@@ -204,6 +263,9 @@ class TestApiTask(BootTransactionTestCase):
 
                 image1.seek(0)
                 image2.seek(0)
+            
+            img1.close()
+            ms_img.close()
 
             # Cannot create a task with images[], name, but invalid processing node parameter
             res = client.post("/api/projects/{}/tasks/".format(project.id), {
@@ -241,6 +303,9 @@ class TestApiTask(BootTransactionTestCase):
             # Extent should be null
             self.assertTrue(res.data['extent'] is None)
 
+            # Srs name should be ""
+            self.assertEqual(res.data['srs']['name'], "")
+
             # processing_node_name should be null
             self.assertTrue(res.data['processing_node_name'] is None)
 
@@ -255,6 +320,9 @@ class TestApiTask(BootTransactionTestCase):
 
             # Size should be zero
             self.assertEqual(task.size, 0)
+
+            # Crop should be none
+            self.assertTrue(task.crop is None)
 
             # tiles.json, bounds, metadata should not be accessible at this point
             tile_types = ['orthophoto', 'dsm', 'dtm']
@@ -386,11 +454,18 @@ class TestApiTask(BootTransactionTestCase):
             for asset in list(task.ASSETS_MAP.keys()):
                 res = client.get("/api/projects/{}/tasks/{}/download/{}".format(project.id, task.id, asset))
                 self.assertEqual(res.status_code, status.HTTP_200_OK)
+                self.assertTrue('attachment' in res.get('Content-Disposition'))
 
             # We can stream downloads
             res = client.get("/api/projects/{}/tasks/{}/download/{}?_force_stream=1".format(project.id, task.id, list(task.ASSETS_MAP.keys())[0]))
             self.assertTrue(res.status_code == status.HTTP_200_OK)
             self.assertTrue(res.has_header('_stream'))
+
+            # We can inline downloads
+            res = client.get("/api/projects/{}/tasks/{}/download/{}?inline=1".format(project.id, task.id, list(task.ASSETS_MAP.keys())[0]))
+            self.assertTrue(res.status_code == status.HTTP_200_OK)
+            self.assertTrue(res.has_header('Content-Disposition'))
+            self.assertTrue('inline' in res.get('Content-Disposition'))
 
             # The tif files are valid Cloud Optimized GeoTIFF
             self.assertTrue(valid_cogeo(task.assets_path(task.ASSETS_MAP["orthophoto.tif"])))
@@ -404,11 +479,18 @@ class TestApiTask(BootTransactionTestCase):
             res = client.get("/api/projects/{}/tasks/{}/assets/odm_orthophoto/odm_orthophoto.tif".format(project.id, task.id))
             self.assertTrue(res.status_code == status.HTTP_200_OK)
 
+            # EPT dataset should be there/have been created
+            res = client.get("/api/projects/{}/tasks/{}/assets/entwine_pointcloud/ept.json".format(project.id, task.id))
+            self.assertTrue(res.status_code == status.HTTP_200_OK)
+
              # Orthophoto bands field should be populated
             self.assertEqual(len(task.orthophoto_bands), 4)
 
             # Size should be updated
             self.assertTrue(task.size > 0)
+
+            # Crop should still be none
+            self.assertTrue(task.crop is None)
 
             # The owner's used quota should have increased
             self.assertTrue(task.project.owner.profile.used_quota_cached() > 0)
@@ -649,6 +731,32 @@ class TestApiTask(BootTransactionTestCase):
                 self.assertEqual(round(metadata['statistics']['1']['min'], 2), 156.91)
                 self.assertEqual(round(metadata['statistics']['1']['max'], 2), 164.94)
 
+            # Metadata when using ft DSM/DTM
+            for tile_type in ['dsm', 'dtm']:
+                for unit in ["ft", "US survey foot"]:
+
+                    # Change units
+                    dem = task.get_asset_download_path(tile_type + ".tif")
+                    with rasterio.open(dem, "r+") as f:
+                        self.assertIsNone(f.units[0], None)
+                        f.units = (unit, )
+                    
+                    to_unit = 1.0 / get_rasterio_to_meters_factor(dem)
+                    self.assertTrue(to_unit != 1.0)
+
+                    res = client.get("/api/projects/{}/tasks/{}/{}/metadata".format(project.id, task.id, tile_type))
+                    self.assertEqual(res.status_code, status.HTTP_200_OK)
+                    metadata = json.loads(res.content.decode("utf-8"))
+
+                    # Min/max values are what we expect them to be
+                    self.assertEqual(len(metadata['statistics']), 1)
+                    self.assertEqual(round(metadata['statistics']['1']['min'] * to_unit, 2), 156.91)
+                    self.assertEqual(round(metadata['statistics']['1']['max'] * to_unit, 2), 164.94)
+
+                    # Restore units
+                    with rasterio.open(dem, "r+") as f:
+                        f.units = (None, )
+
             # Can access individual tiles
             for tile_type in tile_types:
                 res = client.get("/api/projects/{}/tasks/{}/{}/tiles/{}.png".format(project.id, task.id, tile_type, tile_path[tile_type]))
@@ -706,6 +814,29 @@ class TestApiTask(BootTransactionTestCase):
             res = client.get("/api/projects/{}/tasks/{}/orthophoto/tiles/20/32042/46185.png".format(project.id, task.id))
             self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
+            crop_geojson = {"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[-91.99424117803576,46.84230591442068],[-91.99366182088853,46.84228940253027],[-91.99393808841705,46.84257010397711],[-91.99424117803576,46.84230591442068]]]}}
+
+            # Cannot update with invalid crop
+            res = client.patch("/api/projects/{}/tasks/{}/".format(project.id, task.id), {
+                'crop': "invalid"
+            }, format="json")
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            task.refresh_from_db()
+            self.assertTrue(task.crop is None)
+
+            # Can update with valid crop
+            res = client.patch("/api/projects/{}/tasks/{}/".format(project.id, task.id), {
+                'crop': crop_geojson
+            }, format="json")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertTrue(res.data['crop'] is not None)
+            task.refresh_from_db()
+            self.assertTrue(task.crop is not None)
+
+            # Can get thumbnail when crop is set
+            res = client.get("/api/projects/{}/tasks/{}/thumbnail?size=64".format(project.id, task.id))
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+
             # Can access hillshade, formulas, bands, rescale, color_map
             params = [
                 ("dsm", "color_map=jet&hillshade=3&rescale=150,170", status.HTTP_200_OK),
@@ -751,6 +882,12 @@ class TestApiTask(BootTransactionTestCase):
             for tile_type, url, sc in params:
                 res = client.get("/api/projects/{}/tasks/{}/{}/tiles/{}?{}".format(project.id, task.id, tile_type, tile_path[tile_type], url))
                 self.assertEqual(res.status_code, sc)
+
+                # With crop parameter also
+                crop_url = url + ("" if url == "" else "&") + "crop=1"
+                res = client.get("/api/projects/{}/tasks/{}/{}/tiles/{}?{}".format(project.id, task.id, tile_type, tile_path[tile_type], crop_url))
+                self.assertEqual(res.status_code, sc)
+                
             
             # Can request PNG/JPG/WEBP tiles explicitely
             for ext in ["png", "jpg", "webp"]:
@@ -775,6 +912,19 @@ class TestApiTask(BootTransactionTestCase):
                 res = client.get("/api/projects/{}/tasks/{}/orthophoto/tiles/{}.png?size={}".format(project.id, task.id, tile_path['orthophoto'], s))
                 self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
             
+            # This task's assets cache should not exist
+            ta_cache_dir = task.get_task_assets_cache()
+            self.assertFalse(os.path.isdir(ta_cache_dir))
+
+            # Can access the safe textured model endpoint
+            res = client.get("/api/projects/{}/tasks/{}/textured_model/".format(project.id, task.id))
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+            # The resulting GLB cache should have been created
+            self.assertTrue(os.path.isdir(ta_cache_dir))
+            self.assertTrue(os.path.isfile(os.path.join(ta_cache_dir, "odm_textured_model_geo-2.glb")))
+            
+
             # Another user does not have access to the resources
             other_client = APIClient()
             other_client.login(username="testuser2", password="test1234")
@@ -824,6 +974,36 @@ class TestApiTask(BootTransactionTestCase):
             self.assertTrue(res.status_code == status.HTTP_200_OK)
             
             # He can now save scene / change camera view
+            res = other_client.post("/api/projects/{}/tasks/{}/3d/cameraview".format(project.id, task.id), json.dumps({ "position": [0,0,0], "target": [0,0,0] }), content_type="application/json")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            res = other_client.post("/api/projects/{}/tasks/{}/3d/scene".format(project.id, task.id), json.dumps({ "type": "Potree", "modified": True }), content_type="application/json")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+            # Revert edit
+            res = client.patch("/api/projects/{}/tasks/{}/".format(project.id, task.id), {
+                'public': False,
+                'public_edit': False
+            })
+            
+            # Cannot save again
+            res = other_client.post("/api/projects/{}/tasks/{}/3d/cameraview".format(project.id, task.id), json.dumps({ "position": [0,0,0], "target": [0,0,0] }), content_type="application/json")
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+            
+            # Cannot access project information via project id (which could be enumerated)
+            res = other_client.get("/api/projects/{}/".format(project.id))
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+            
+            # Share entire project
+            res = client.patch("/api/projects/{}/".format(project.id), {
+                'public': True,
+                'public_edit': True
+            })
+
+            # Still cannot access project information via project id (which could be enumerated)
+            res = other_client.get("/api/projects/{}/".format(project.id))
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+            
+            # Can now save since it's shared/editable project-wise
             res = other_client.post("/api/projects/{}/tasks/{}/3d/cameraview".format(project.id, task.id), json.dumps({ "position": [0,0,0], "target": [0,0,0] }), content_type="application/json")
             self.assertEqual(res.status_code, status.HTTP_200_OK)
             res = other_client.post("/api/projects/{}/tasks/{}/3d/scene".format(project.id, task.id), json.dumps({ "type": "Potree", "modified": True }), content_type="application/json")
@@ -886,6 +1066,9 @@ class TestApiTask(BootTransactionTestCase):
 
             task_assets_path = os.path.join(settings.MEDIA_ROOT, task_directory_path(task.id, task.project.id))
             self.assertFalse(os.path.exists(task_assets_path))
+
+            # Assets cache should also be removed
+            self.assertFalse(os.path.isdir(ta_cache_dir))
 
 
         # Create a task
@@ -963,7 +1146,6 @@ class TestApiTask(BootTransactionTestCase):
             task.refresh_from_db()
             self.assertTrue(task.last_error is None)
 
-
             # Reassigning the task to another project should move its assets
             self.assertTrue(os.path.exists(full_task_directory_path(task.id, project.id)))
             self.assertTrue(len(task.scan_images()) == 2)
@@ -973,6 +1155,23 @@ class TestApiTask(BootTransactionTestCase):
             task.refresh_from_db()
             self.assertFalse(os.path.exists(full_task_directory_path(task.id, project.id)))
             self.assertTrue(os.path.exists(full_task_directory_path(task.id, other_project.id)))
+
+            # Move back
+            task.project = project
+            task.save()
+            task.refresh_from_db()
+
+            # Compacting the task should remove the images
+            # but not the assets
+            self.assertTrue(len(os.listdir(task.assets_path())) > 0)
+            self.assertEqual(len(task.scan_images()), 2)
+
+            res = client.post("/api/projects/{}/tasks/{}/compact/".format(project.id, task.id))
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            task.refresh_from_db()
+
+            self.assertTrue(len(os.listdir(task.assets_path())) > 0)
+            self.assertEqual(len(task.scan_images()), 0)            
 
         # Restart node-odm as to not generate orthophotos
         testWatch.clear()
@@ -1008,6 +1207,9 @@ class TestApiTask(BootTransactionTestCase):
             # EPSG should be populated
             self.assertEqual(task.epsg, 32615)
 
+            # WKT should not (because EPSG is)
+            self.assertIsNone(task.wkt)
+
             # Orthophoto bands should not be populated
             self.assertEqual(len(task.orthophoto_bands), 0)
 
@@ -1028,6 +1230,11 @@ class TestApiTask(BootTransactionTestCase):
 
             # Extent should be set
             self.assertTrue(len(res.data['extent']), 4)
+
+            # SRS name/units should be set
+            self.assertEqual(res.data['srs']['name'], "WGS 84 / UTM zone 15N")
+            self.assertEqual(res.data['srs']['units'], "m")
+            
 
         # Can duplicate a task
         res = client.post("/api/projects/{}/tasks/{}/duplicate/".format(project.id, task.id))
@@ -1078,6 +1285,8 @@ class TestApiTask(BootTransactionTestCase):
         task = Task.objects.create(project=project, name="Test")
         pnode = ProcessingNode.objects.create(hostname="invalid-host", port=11223)
         another_pnode = ProcessingNode.objects.create(hostname="invalid-host-2", port=11223)
+        assign_perm('view_processingnode', project.owner, pnode)
+        assign_perm('view_processingnode', project.owner, another_pnode)
 
         # By default
         self.assertTrue(task.auto_processing_node)
@@ -1162,6 +1371,8 @@ class TestApiTask(BootTransactionTestCase):
 
         # Bring a processing node online
         pnode = ProcessingNode.objects.create(hostname="invalid-host", port=11223)
+        assign_perm('view_processingnode', user, pnode)
+
         pnode.last_refreshed = timezone.now()
         pnode.save()
         self.assertTrue(pnode.is_online())
@@ -1173,7 +1384,7 @@ class TestApiTask(BootTransactionTestCase):
         task.refresh_from_db()
         self.assertTrue(task.processing_node is None)
 
-    def test_task_chunked_uploads(self):
+    def test_task_multifile_uploads(self):
         with start_processing_node():
             client = APIClient()
 
@@ -1186,7 +1397,8 @@ class TestApiTask(BootTransactionTestCase):
             )
 
             pnode = ProcessingNode.objects.create(hostname="localhost", port=11223)
-
+            assign_perm('view_processingnode', user, pnode)
+            
             # task creation via chunked upload
             image1 = open("app/fixtures/tiny_drone_image.jpg", 'rb')
             image2 = open("app/fixtures/tiny_drone_image_2.jpg", 'rb')
@@ -1267,6 +1479,107 @@ class TestApiTask(BootTransactionTestCase):
             image1.close()
             image2.close()
 
+
+    def test_task_chunked_uploads(self):
+        with start_processing_node():
+            client = APIClient()
+
+            user = User.objects.get(username="testuser")
+            self.assertFalse(user.is_superuser)
+
+            project = Project.objects.create(
+                owner=user,
+                name="test project"
+            )
+
+            pnode = ProcessingNode.objects.create(hostname="localhost", port=11223)
+            assign_perm('view_processingnode', user, pnode)
+            
+            # task creation via chunked upload
+            im1 = "app/fixtures/tiny_drone_image.jpg"
+            image1 = open(im1, 'rb')
+            image2 = open("app/fixtures/tiny_drone_image_2.jpg", 'rb')
+
+            client.login(username="testuser", password="test1234")
+
+            res = client.post("/api/projects/{}/tasks/".format(project.id), {
+                'auto_processing_node': 'true',
+                'partial': 'true'
+            }, format="multipart")
+            self.assertTrue(res.status_code == status.HTTP_201_CREATED)
+
+            task = Task.objects.get(pk=res.data['id'])
+
+            # Upload works with one chunked image
+            image1_size = os.path.getsize(im1)
+            chunk_1_size = image1_size // 2
+            chunk_1_path = os.path.join(os.path.dirname(im1), "1.jpg")
+            chunk_2_path = os.path.join(os.path.dirname(im1), "2.jpg")
+            with open(chunk_1_path, 'wb') as f:
+                image1.seek(0)
+                f.write(image1.read(chunk_1_size))
+            with open(chunk_2_path, 'wb') as f:
+                f.write(image1.read())
+            
+            chunk_1 = open(chunk_1_path, 'rb')
+            chunk_2 = open(chunk_2_path, 'rb')
+            image1.close()
+
+            res = client.post("/api/projects/{}/tasks/{}/upload/".format(project.id, task.id), {
+                'images': [chunk_1],
+                'dzuuid': 'abc-test',
+                'dzchunkindex': 0,
+                'dztotalchunkcount': 2,
+                'dzchunkbyteoffset': 0
+            }, format="multipart")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(res.data['uploaded']), 0)
+            chunk_1.close()
+                
+            res = client.post("/api/projects/{}/tasks/{}/upload/".format(project.id, task.id), {
+                'images': [chunk_2],
+                'dzuuid': 'abc-test',
+                'dzchunkindex': 1,
+                'dztotalchunkcount': 2,
+                'dzchunkbyteoffset': chunk_1_size
+            }, format="multipart")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(res.data['uploaded']), 1)
+            self.assertEqual(res.data['uploaded']['2.jpg'], image1_size)
+            chunk_2.close()
+
+            # And second image
+            res = client.post("/api/projects/{}/tasks/{}/upload/".format(project.id, task.id), {
+                'images': [image2],
+            }, format="multipart")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(res.data['success'], True)
+            image2.seek(0)
+
+            # Task hasn't started
+            self.assertEqual(task.upload_progress, 0.0)
+
+            # Can commit with two images
+            res = client.post("/api/projects/{}/tasks/{}/commit/".format(project.id, task.id))
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(res.data['id'], str(task.id))
+
+            task.refresh_from_db()
+
+            # No longer partial
+            self.assertFalse(task.partial)
+
+            # Image count has been updated
+            self.assertEqual(task.images_count, 2)
+
+            # Make sure processing begins
+            worker.tasks.process_pending_tasks()
+            time.sleep(DELAY)
+
+            task.refresh_from_db()
+            self.assertEqual(task.upload_progress, 1.0)
+
+            image2.close()
 
     def test_task_list(self):
         user = User.objects.get(username="testuser")

@@ -5,7 +5,7 @@ import re
 
 from app import models
 
-def get_and_check_project(request, project_pk, perms=('view_project',)):
+def get_and_check_project(request, project_pk, perms=('view_project',), defer=False):
     """
     Django comes with a standard `model level` permission system. You can
     check whether users are logged-in and have privileges to act on things
@@ -27,6 +27,9 @@ def get_and_check_project(request, project_pk, perms=('view_project',)):
     project = models.Project.objects.get(pk=project_pk, deleting=False)
     return project
 
+def check_project_perms(request, project, perms=('view_project',)):
+    for perm in perms:
+        if not request.user.has_perm(perm, project): raise exceptions.NotFound()
 
 def hex2rgb(hex_color, with_alpha=False):
     """

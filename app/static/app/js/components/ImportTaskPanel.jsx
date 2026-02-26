@@ -53,7 +53,7 @@ class ImportTaskPanel extends React.Component {
           clickable: this.uploadButton,
           timeout: 2147483647,
           chunking: true,
-          chunkSize: 16000000, // 16MB,
+          chunkSize: 8000000, // 8MB,
           retryChunks: true,
           retryChunksLimit: 20,
           headers: {
@@ -141,8 +141,12 @@ class ImportTaskPanel extends React.Component {
         this.setState({error: json.error || interpolate(_("Invalid JSON response: %(error)s"), {error: JSON.stringify(json)})});
       }
     })
-    .fail(() => {
-        this.setState({importingFromUrl: false, error: _("Cannot import from URL. Check your internet connection.")});
+    .fail((e) => {
+      let error = _("Cannot import from URL. Check your internet connection.");
+      if (e && e.responseJSON && Array.isArray(e.responseJSON) && e.responseJSON.length && typeof e.responseJSON[0] === 'string'){
+        error = e.responseJSON[0];
+      }
+      this.setState({importingFromUrl: false, error});
     });
   }
 
@@ -160,7 +164,7 @@ class ImportTaskPanel extends React.Component {
 
           <button type="button" className="close theme-color-primary" title="Close" onClick={this.cancel}><span aria-hidden="true">&times;</span></button>
           <h4>{_("Import Assets or Backups")}</h4>
-          <p><Trans params={{arrow: '<i class="glyphicon glyphicon-arrow-right"></i>'}}>{_("You can import .zip files that have been exported from existing tasks via Download Assets %(arrow)s All Assets | Backup.")}</Trans></p>
+          <p><Trans params={{arrow: '<i class="glyphicon glyphicon-arrow-right"></i>'}}>{_("You can import .zip files that have been exported from existing tasks via Download %(arrow)s All Assets | Backup.")}</Trans></p>
           
           <button disabled={this.state.uploading}
                   type="button" 

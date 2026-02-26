@@ -59,6 +59,14 @@ export default {
         return (url.indexOf("?") !== -1 ? url.slice(0, url.indexOf("?")) : url) + this.toSearchQuery(params);
     },
 
+    buildUrlReplaceParams: function(url, params){
+      let q = this.queryParams({search: url});
+      for (let k in params){
+        q[k] = params[k];
+      }
+      return this.buildUrlWithQuery(url, q);
+    },
+
     clone: function(obj){
       return JSON.parse(JSON.stringify(obj));
     },
@@ -95,6 +103,15 @@ export default {
       FileSaver.saveAs(blob, filename);
     },
 
+    downloadAs: function(url, filename){
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    },
+
     // http://stackoverflow.com/questions/15900485/correct-way-to-convert-size-in-bytes-to-kb-mb-gb-in-javascript
     bytesToSize: function(bytes, decimals = 2){
       if(bytes == 0) return '0 byte';
@@ -106,7 +123,11 @@ export default {
     },
 
     isMobile: function(){
-      return navigator.userAgent.match(/(iPad)|(iPhone)|(iPod)|(android)|(webOS)/i);
+      return navigator.userAgent.match(/(android)|(webOS)/i) || this.isIOS();
+    },
+
+    isIOS: function(){
+      return navigator.userAgent.match(/(iPad)|(iPhone)|(iPod)/i) || (navigator.userAgent.match(/Mac/i) && "ontouchend" in document);
     },
 
     userInputToFilename(text, extension = ""){
@@ -119,6 +140,10 @@ export default {
             v = c === 'x' ? r : r & 0x3 | 0x8;
         return v.toString(16);
       });
+    },
+
+    isNumeric(n){
+      return !isNaN(parseFloat(n)) && isFinite(n);
     }
 };
 

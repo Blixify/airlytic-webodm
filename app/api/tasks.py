@@ -1,10 +1,12 @@
 import os
 import re
 import shutil
+import uuid as uuidmod
 from wsgiref.util import FileWrapper
 
 import mimetypes
 import rasterio
+from rasterio.vrt import WarpedVRT
 from rasterio.enums import ColorInterp
 from PIL import Image
 import io
@@ -18,7 +20,7 @@ from django.http import FileResponse
 from django.http import HttpResponse
 from django.http import StreamingHttpResponse
 from django.contrib.gis.geos import Polygon
-from app.vendor import zipfly
+from zipstream.ng import ZipStream
 from rest_framework import status, serializers, viewsets, filters, exceptions, permissions, parsers
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
@@ -30,10 +32,12 @@ from app import models, pending_actions
 from nodeodm import status_codes
 from nodeodm.models import ProcessingNode
 from worker import tasks as worker_tasks
-from .common import get_and_check_project, get_asset_download_filename
+from .common import get_and_check_project, get_asset_download_filename, check_project_perms
 from .tags import TagsField
 from app.security import path_traversal_check
 from django.utils.translation import gettext_lazy as _
+from .fields import PolygonGeometryField
+from app.geoutils import geom_transform_wkt_bbox, get_srs_name_units_from_epsg_or_wkt
 from webodm import settings
 
 def flatten_files(request_files):
@@ -55,6 +59,8 @@ class TaskSerializer(serializers.ModelSerializer):
     statistics = serializers.SerializerMethodField()
     extent = serializers.SerializerMethodField()
     tags = TagsField(required=False)
+    crop = PolygonGeometryField(required=False, allow_null=True)
+    srs = serializers.SerializerMethodField()
 
     def get_processing_node_name(self, obj):
         if obj.processing_node is not None:
@@ -85,14 +91,10 @@ class TaskSerializer(serializers.ModelSerializer):
         return []
 
     def get_extent(self, obj):
-        if obj.orthophoto_extent is not None:
-            return obj.orthophoto_extent.extent
-        elif obj.dsm_extent is not None:
-            return obj.dsm_extent.extent
-        elif obj.dtm_extent is not None:
-            return obj.dsm_extent.extent
-        else:
-            return None
+        return obj.get_extent()
+    
+    def get_srs(self, obj):
+        return get_srs_name_units_from_epsg_or_wkt(obj.epsg, obj.wkt)
 
     class Meta:
         model = models.Task
@@ -105,7 +107,7 @@ class TaskViewSet(viewsets.ViewSet):
     A task represents a set of images and other input to be sent to a processing node.
     Once a processing node completes processing, results are stored in the task.
     """
-    queryset = models.Task.objects.all()
+    queryset = models.Task.objects.all().select_related('project')
     
     parser_classes = (parsers.MultiPartParser, parsers.JSONParser, parsers.FormParser, )
     ordering_fields = '__all__'
@@ -125,9 +127,9 @@ class TaskViewSet(viewsets.ViewSet):
         return [permission() for permission in permission_classes]
 
     def set_pending_action(self, pending_action, request, pk=None, project_pk=None, perms=('change_project', )):
-        get_and_check_project(request, project_pk, perms)
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project, perms)
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
@@ -153,24 +155,62 @@ class TaskViewSet(viewsets.ViewSet):
     def remove(self, *args, **kwargs):
         return self.set_pending_action(pending_actions.REMOVE, *args, perms=('delete_project', ), **kwargs)
 
+    @action(detail=True, methods=['post'])
+    def compact(self, *args, **kwargs):
+        return self.set_pending_action(pending_actions.COMPACT, *args, perms=('delete_project', ), **kwargs)
+
     @action(detail=True, methods=['get'])
     def output(self, request, pk=None, project_pk=None):
         """
         Retrieve the console output for this task.
+
         An optional "line" query param can be passed to retrieve
         only the output starting from a certain line number.
+
+        An optional "limit" query param can be passed to limit
+        the number of lines to be returned
+
+        An optional "f" query param can be either: "text" (default), "json" or "raw"
         """
-        get_and_check_project(request, project_pk)
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project)
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
-        line_num = max(0, int(request.query_params.get('line', 0)))
-        return Response('\n'.join(task.console.output().rstrip().split('\n')[line_num:]))
+        try:
+            line_num = max(0, int(request.query_params.get('line', 0)))
+            limit = int(request.query_params.get('limit', 0)) or None
+            fmt = request.query_params.get('f', 'text')
+            if fmt not in ['text', 'json', 'raw']:
+                raise ValueError("Invalid format")
+        except ValueError:
+            raise exceptions.ValidationError("Invalid parameter")
+
+        lines = task.console.output().rstrip().split('\n')
+        count = len(lines)
+        line_start = min(line_num, count)
+        line_end = None
+
+        if limit is not None:
+            if limit > 0:
+                line_end = line_num + limit
+            else:
+                line_start = line_start if count - line_start <= abs(limit) else count - abs(limit) 
+                line_end = None 
+
+        if fmt == 'text':
+            return Response('\n'.join(lines[line_start:line_end]))
+        elif fmt == 'raw':
+            return HttpResponse('\n'.join(lines[line_start:line_end]), content_type="text/plain; charset=utf-8")
+        else:
+            return Response({
+                'lines': lines[line_start:line_end],
+                'count': count
+            })
 
     def list(self, request, project_pk=None):
-        get_and_check_project(request, project_pk)
+        get_and_check_project(request, project_pk, defer=True)
         query = Q(project=project_pk)
 
         status = request.query_params.get('status')
@@ -209,8 +249,8 @@ class TaskViewSet(viewsets.ViewSet):
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
-        if not task.public:
-            get_and_check_project(request, task.project.id)
+        if not (task.public or task.project.public):
+            check_project_perms(request, task.project)
 
         serializer = TaskSerializer(task)
         return Response(serializer.data)
@@ -220,9 +260,14 @@ class TaskViewSet(viewsets.ViewSet):
         """
         Commit a task after all images have been uploaded
         """
-        get_and_check_project(request, project_pk, ('change_project', ))
+        # import time
+        # time.sleep(10)
+        # return Response('', status=524)
+        # raise exceptions.ValidationError(detail=_("Random upload failure for testing"))
+
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project, ('change_project', ))
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
@@ -244,9 +289,9 @@ class TaskViewSet(viewsets.ViewSet):
         """
         Add images to a task
         """
-        get_and_check_project(request, project_pk, ('change_project', ))
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project, ('change_project', ))
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
@@ -254,12 +299,42 @@ class TaskViewSet(viewsets.ViewSet):
         if len(files) == 0:
             raise exceptions.ValidationError(detail=_("No files uploaded"))
 
-        uploaded = task.handle_images_upload(files)
-        task.images_count = len(task.scan_images())
-        # Update other parameters such as processing node, task name, etc.
-        serializer = TaskSerializer(task, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        chunk_info = None
+        chunk_index = request.data.get('dzchunkindex')
+        uuid = request.data.get('dzuuid') 
+        total_chunk_count = request.data.get('dztotalchunkcount', None)
+        if len(files) == 1 and chunk_index is not None and uuid is not None and total_chunk_count is not None:
+            byte_offset = request.data.get('dzchunkbyteoffset', 0)
+            try:
+                chunk_index = int(chunk_index)
+                byte_offset = int(byte_offset)
+                total_chunk_count = int(total_chunk_count)
+            except ValueError:
+                raise exceptions.ValidationError(detail="chunkIndex is not an int")
+            
+            chunk_info = {
+                'uuid': re.sub('[^0-9a-zA-Z-]+', "", uuid),
+                'chunk_index': chunk_index,
+                'byte_offset': byte_offset,
+                'total_chunk_count': total_chunk_count,
+                'tmp_upload_file': os.path.join(settings.FILE_UPLOAD_TEMP_DIR, f"{uuid}.upload")
+            }
+
+        # 50% of the time, raise an exception
+        # import random
+        # if random.random() < 0.5:
+        #     import time
+        #     time.sleep(10)
+        #     return Response('', status=524)
+        #     raise exceptions.ValidationError(detail=_("Random upload failure for testing"))
+
+        uploaded = task.handle_images_upload(files, chunk_info)
+        if len(uploaded) > 0:
+            task.images_count = len(task.scan_images())
+            # Update other parameters such as processing node, task name, etc.
+            serializer = TaskSerializer(task, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         
         return Response({'success': True, 'uploaded': uploaded}, status=status.HTTP_200_OK)
 
@@ -268,9 +343,9 @@ class TaskViewSet(viewsets.ViewSet):
         """
         Duplicate a task
         """
-        get_and_check_project(request, project_pk, ('change_project', ))
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project, ('change_project', ))
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
@@ -289,8 +364,8 @@ class TaskViewSet(viewsets.ViewSet):
         align_task = None
         if align_to is not None and align_to != "auto" and align_to != "":
             try:
-                align_task = models.Task.objects.get(pk=align_to)
-                get_and_check_project(request, align_task.project.id, ('view_project', ))
+                align_task = models.Task.objects.select_related('project').get(pk=align_to)
+                check_project_perms(request, align_task.project, ('view_project', ))
             except ObjectDoesNotExist:
                 raise exceptions.ValidationError(detail=_("Cannot create task, alignment task is not valid"))
         
@@ -330,16 +405,16 @@ class TaskViewSet(viewsets.ViewSet):
 
 
     def update(self, request, pk=None, project_pk=None, partial=False):
-        get_and_check_project(request, project_pk, ('change_project', ))
         try:
             task = self.queryset.get(pk=pk, project=project_pk)
+            check_project_perms(request, task.project, ('change_project', ))
         except (ObjectDoesNotExist, ValidationError):
             raise exceptions.NotFound()
 
         # Check that a user has access to reassign a project
         if 'project' in request.data:
             try:
-                get_and_check_project(request, request.data['project'], ('change_project', ))
+                get_and_check_project(request, request.data['project'], ('change_project', ), defer=True)
             except exceptions.NotFound:
                 raise exceptions.PermissionDenied()
 
@@ -358,7 +433,7 @@ class TaskViewSet(viewsets.ViewSet):
 
 
 class TaskNestedView(APIView):
-    queryset = models.Task.objects.all().defer('orthophoto_extent', 'dtm_extent', 'dsm_extent', )
+    queryset = models.Task.objects.all().select_related('project')
     permission_classes = (AllowAny, )
 
     def get_and_check_task(self, request, pk, annotate={}):
@@ -394,16 +469,15 @@ def download_file_response(request, filePath, content_disposition, download_file
 
 
 def download_file_stream(request, stream, content_disposition, download_filename=None):
-    if isinstance(stream, zipfly.ZipStream):
-        f = stream.generator()
-    else:
+    if not isinstance(stream, ZipStream):
         # This should never happen, but just in case..
         raise exceptions.ValidationError("stream not a zipstream instance")
     
-    response = StreamingHttpResponse(f, content_type=(mimetypes.guess_type(download_filename)[0] or "application/zip"))
+    response = StreamingHttpResponse(stream, content_type=(mimetypes.guess_type(download_filename)[0] or "application/zip"))
 
     response['Content-Type'] = mimetypes.guess_type(download_filename)[0] or "application/zip"
     response['Content-Disposition'] = "{}; filename={}".format(content_disposition, download_filename)
+    response['Content-Length'] = len(stream)
 
     # For testing
     response['_stream'] = 'yes'
@@ -433,11 +507,15 @@ class TaskDownloads(TaskNestedView):
             raise exceptions.NotFound(_("Asset does not exist"))
         
         download_filename = request.GET.get('filename', get_asset_download_filename(task, asset))
+        content_disposition = 'attachment'
+
+        if request.GET.get('inline') is not None:
+            content_disposition = 'inline'
 
         if is_stream:
-            return download_file_stream(request, asset_fs, 'attachment', download_filename=download_filename)
+            return download_file_stream(request, asset_fs, content_disposition, download_filename=download_filename)
         else:
-            return download_file_response(request, asset_fs, 'attachment', download_filename=download_filename)
+            return download_file_response(request, asset_fs, content_disposition, download_filename=download_filename)
 
 
 class TaskThumbnail(TaskNestedView):
@@ -475,22 +553,52 @@ class TaskThumbnail(TaskNestedView):
             if ColorInterp.alpha in ci:
                 indexes += (ci.index(ColorInterp.alpha) + 1, )
             
-            w = raster.width
-            h = raster.height
-            d = max(w, h)
-            dw = (d - w) // 2
-            dh = (d - h) // 2
-            win = rasterio.windows.Window(-dw, -dh, d, d)
+            if task.crop is not None:
+                cutline, (minx, miny, maxx, maxy) = geom_transform_wkt_bbox(task.crop, raster, 'raster')
 
-            img = raster.read(indexes=indexes, window=win, boundless=True, fill_value=0, out_shape=(
-                len(indexes),
-                thumb_size,
-                thumb_size,
-            ), resampling=rasterio.enums.Resampling.nearest).transpose((1, 2, 0))
-        
+                w = maxx - minx
+                h = maxy - miny
+                win = rasterio.windows.Window(minx, miny, w, h)
+                ratio = w / h
+                if ratio > 1:
+                    out_width = thumb_size
+                    out_height = int(thumb_size / ratio)
+                else:
+                    out_height = thumb_size
+                    out_width = int(thumb_size * ratio)
+
+
+                with WarpedVRT(raster, cutline=cutline, nodata=0) as vrt:
+                    rgb = vrt.read(indexes=indexes, window=win, fill_value=0, out_shape=(
+                        len(indexes),
+                        out_height,
+                        out_width,
+                    ), resampling=rasterio.enums.Resampling.nearest)
+                img = np.zeros((len(indexes), thumb_size, thumb_size), dtype=rgb.dtype)
+                y_offset = (thumb_size - out_height) // 2
+                x_offset = (thumb_size - out_width) // 2
+
+                # Place the output image in the center
+                img[:, y_offset:y_offset + out_height, x_offset:x_offset + out_width] = rgb
+            else:
+                w = raster.width
+                h = raster.height
+                d = max(w, h)
+                dw = (d - w) // 2
+                dh = (d - h) // 2
+                win = rasterio.windows.Window(-dw, -dh, d, d)
+
+                img = raster.read(indexes=indexes, window=win, boundless=True, fill_value=0, out_shape=(
+                    len(indexes),
+                    thumb_size,
+                    thumb_size,
+                ), resampling=rasterio.enums.Resampling.nearest)
+
+            img = img.transpose((1, 2, 0))
+
         if img.dtype != np.uint8:
             img = img.astype(np.float32)
-            
+
             # Ignore alpha values
             minval = img[:,:,:3].min()
             maxval = img[:,:,:3].max()
@@ -498,6 +606,10 @@ class TaskThumbnail(TaskNestedView):
             if minval != maxval:
                 img[:,:,:3] -= minval
                 img[:,:,:3] *= (255.0/(maxval-minval))
+
+            # Normalize alpha
+            if img.shape[2] == 4:
+                img[:,:,3] = np.where(img[:,:,3]==0, 0, 255)
             
             img = img.astype(np.uint8)
 
@@ -577,8 +689,11 @@ class TaskAssetsImport(APIView):
         if not import_url and len(files) != 1:
             raise exceptions.ValidationError(detail=_("Cannot create task, you need to upload 1 file"))
 
-        if import_url and len(files) > 0:
-            raise exceptions.ValidationError(detail=_("Cannot create task, either specify a URL or upload 1 file."))
+        if import_url:
+            if len(files) > 0:
+                raise exceptions.ValidationError(detail=_("Cannot create task, either specify a URL or upload 1 file."))
+            if re.match(r"^https?:\/\/.+$", import_url.lower()) is None:
+                raise exceptions.ValidationError(detail=_("Invalid URL. Did you mean %(hint)s ?") % { 'hint': f'http://{import_url}'})
 
         chunk_index = request.data.get('dzchunkindex')
         uuid = request.data.get('dzuuid') 
@@ -608,8 +723,8 @@ class TaskAssetsImport(APIView):
                     for chunk in files[0].chunks():
                         fd.write(chunk)
                 else:
-                    with open(files[0].temporary_file_path(), 'rb') as file:
-                        fd.write(file.read())
+                    with open(files[0].temporary_file_path(), 'rb') as f:
+                        shutil.copyfileobj(f, fd)
             
             if chunk_index + 1 < total_chunk_count:
                 return Response({'uploaded': True}, status=status.HTTP_200_OK)
@@ -642,3 +757,234 @@ class TaskAssetsImport(APIView):
 
         serializer = TaskSerializer(task)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+
+"""
+Task external import functions
+"""
+
+class TaskExternalImportInit(APIView):
+    permission_classes = (permissions.AllowAny,)
+    parser_classes = (parsers.MultiPartParser, parsers.JSONParser, parsers.FormParser,)
+
+    def post(self, request, project_pk=None):
+        project = get_and_check_project(request, project_pk, ('change_project',))
+
+        uuid = str(uuidmod.uuid4())
+        tmp_upload_dir = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, f"external-import-{uuid}")
+        os.makedirs(tmp_upload_dir, exist_ok=True)
+
+        return Response({"uuid": uuid})
+
+
+EXTERNAL_ASSET_FILES = {
+    'orthophoto': ['orthophoto.tif'],
+    'dsm': ['dsm.tif'],
+    'dtm': ['dtm.tif'],
+    'pointcloud': ['georeferenced_model.laz', 'georeferenced_model.las'],
+    'texturedmodel': ['textured_model.glb'],
+}
+
+def get_external_import_tmpdir(request):
+    uuid = request.data.get('uuid', None)
+    try:
+        uuidmod.UUID(uuid, version=4)
+        tmp_upload_dir = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, f"external-import-{uuid}")
+        if not os.path.isdir(tmp_upload_dir):
+            raise ValueError("Invalid uuid")
+        try:
+            # Just in case
+            path_traversal_check(tmp_upload_dir, settings.FILE_UPLOAD_TEMP_DIR)
+        except SuspiciousFileOperation:
+            raise exceptions.NotFound(_("Invalid uuid"))
+        return tmp_upload_dir
+    except (TypeError, ValueError, AttributeError):
+        raise exceptions.ValidationError(detail=_("Invalid uuid"))
+
+
+class TaskExternalImportUpload(APIView):
+    permission_classes = (permissions.AllowAny,)
+    parser_classes = (parsers.MultiPartParser, parsers.JSONParser, parsers.FormParser,)
+
+    def post(self, request, project_pk=None):
+        project = get_and_check_project(request, project_pk, ('change_project',))
+        files = flatten_files(request.FILES)
+        tmp_upload_dir = get_external_import_tmpdir(request)
+
+        if len(files) != 1:
+            raise exceptions.ValidationError(detail=_("Cannot create task, you need to upload 1 file"))
+
+        file_type = [k for k in request.FILES][0]
+        file_ext = os.path.splitext(files[0].name)[1]
+        
+        asset_file = None
+        asset_file_candidates = EXTERNAL_ASSET_FILES.get(file_type)
+        if asset_file_candidates is None: 
+            raise exceptions.ValidationError(detail=_("Invalid file type"))
+
+        for f in asset_file_candidates:
+            if os.path.splitext(f)[1].lower() == file_ext.lower():
+                asset_file = f
+                break
+
+        if asset_file is None:
+            raise exceptions.ValidationError(detail=_("Invalid file type"))
+
+        chunk_index = request.data.get('dzchunkindex')
+        uuid = request.data.get('dzuuid') 
+        total_chunk_count = request.data.get('dztotalchunkcount', None)
+
+        # 50% of the time, raise an exception
+        # import random
+        # if random.random() < 0.5:
+        #     import time
+        #     time.sleep(2)
+        #     return Response('', status=524)
+        #     raise exceptions.ValidationError(detail=_("Random upload failure for testing"))
+
+        # Chunked upload?
+        tmp_upload_file = None
+        if len(files) > 0 and chunk_index is not None and uuid is not None and total_chunk_count is not None:
+            byte_offset = request.data.get('dzchunkbyteoffset', 0) 
+
+            try:
+                chunk_index = int(chunk_index)
+                byte_offset = int(byte_offset)
+                total_chunk_count = int(total_chunk_count)
+            except ValueError:
+                raise exceptions.ValidationError(detail=_("Some parameters are not integers"))
+            uuid = re.sub('[^0-9a-zA-Z-]+', "", uuid)
+
+            tmp_upload_file = os.path.join(tmp_upload_dir, f"{uuid}.upload")
+            if os.path.isfile(tmp_upload_file) and chunk_index == 0:
+                os.unlink(tmp_upload_file)
+            
+            with open(tmp_upload_file, 'ab') as fd:
+                fd.truncate(byte_offset)
+                fd.seek(byte_offset)
+                if isinstance(files[0], InMemoryUploadedFile):
+                    for chunk in files[0].chunks():
+                        fd.write(chunk)
+                else:
+                    with open(files[0].temporary_file_path(), 'rb') as f:
+                        shutil.copyfileobj(f, fd)
+            
+            if chunk_index + 1 < total_chunk_count:
+                return Response({'uploaded': True}, status=status.HTTP_200_OK)
+
+        # Ready to move to assets
+        destination_file = os.path.join(tmp_upload_dir, asset_file)
+
+        # Non-chunked file import
+        if tmp_upload_file is None and len(files) > 0:
+            with open(destination_file, 'wb+') as fd:
+                if isinstance(files[0], InMemoryUploadedFile):
+                    for chunk in files[0].chunks():
+                        fd.write(chunk)
+                else:
+                    with open(files[0].temporary_file_path(), 'rb') as file:
+                        copyfileobj(file, fd)
+        elif tmp_upload_file is not None:
+            # Move
+            shutil.move(tmp_upload_file, destination_file)
+
+        return Response({'uploaded': True, 'done': True, 'asset': asset_file}, status=status.HTTP_200_OK)
+
+class TaskExternalImportCommit(APIView):
+    permission_classes = (permissions.AllowAny,)
+    parser_classes = (parsers.MultiPartParser, parsers.JSONParser, parsers.FormParser,)
+
+    def post(self, request, project_pk=None):
+        project = get_and_check_project(request, project_pk, ('change_project',))
+        
+        tmp_upload_dir = get_external_import_tmpdir(request)
+        task_name = request.data.get('name', _('Imported Task'))
+
+        # Quick assets validation (this should be fast)
+        try:
+            asset_count = 0
+            for asset_type in EXTERNAL_ASSET_FILES:
+                asset_file_candidates = EXTERNAL_ASSET_FILES[asset_type]
+                for asset_file in asset_file_candidates:
+                    src_path = os.path.join(tmp_upload_dir, asset_file)
+                    if os.path.isfile(src_path):
+                        if asset_type == "orthophoto":
+                            with rasterio.open(src_path, "r") as f:
+                                if f.crs is None:
+                                    raise exceptions.ValidationError(detail=_("GeoTIFF must have a valid CRS"))
+                        
+                        if asset_type in ["dsm", "dtm"]:
+                            with rasterio.open(src_path, "r") as f:
+                                if f.crs is None:
+                                    raise exceptions.ValidationError(detail=_("GeoTIFF must have a valid CRS"))
+                                if f.count > 2:
+                                    raise exceptions.ValidationError(detail=_("Elevation model must have at most 2 band"))
+
+                        if asset_type == "pointcloud":
+                            with open(src_path, "rb") as f:
+                                magic = f.read(4)
+                                if magic != b"LASF":
+                                    raise exceptions.ValidationError(detail=_("Point cloud must be a valid LAZ/LAS file"))
+
+                        if asset_type == "texturedmodel":
+                            with open(src_path, "rb") as f:
+                                magic = f.read(4)
+                                if magic != b"glTF":
+                                    raise exceptions.ValidationError(detail=_("Textured model must be a valid GLB file"))
+                        asset_count += 1
+            
+            if asset_count == 0:
+                raise exceptions.ValidationError(detail=_("No assets uploaded"))
+            
+            with transaction.atomic():
+                task = models.Task.objects.create(project=project,
+                                                auto_processing_node=False,
+                                                name=task_name,
+                                                import_url="file://external",
+                                                status=status_codes.RUNNING,
+                                                pending_action=pending_actions.IMPORT)
+                task.create_task_directories()
+
+                for asset_candidates in EXTERNAL_ASSET_FILES.values():
+                    for asset in asset_candidates:
+                        src_path = os.path.join(tmp_upload_dir, asset)
+                        if os.path.isfile(src_path):
+                            dst_path = task.get_asset_download_path(asset)
+                            dst_dir = os.path.dirname(dst_path)
+                            os.makedirs(dst_dir, exist_ok=True)
+                            shutil.move(src_path, dst_path)
+
+            worker_tasks.process_task.delay(task.id)
+
+            serializer = TaskSerializer(task)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        finally:
+            if tmp_upload_dir and os.path.isdir(tmp_upload_dir):
+                try:
+                    shutil.rmtree(tmp_upload_dir)
+                except OSError:
+                    pass
+
+"""
+Task safe textured model endpoint
+"""
+class TaskSafeTexturedModel(TaskNestedView):
+    def get(self, request, pk=None, project_pk=None):
+        """
+        Downloads a task's safe textured model (if available)
+        """
+        task = self.get_and_check_task(request, pk)
+
+        platform = request.query_params.get('platform', '')
+        max_size_mb = 120
+        if platform == "mobile":
+            max_size_mb = 60
+        elif platform == "ios":
+            max_size_mb = 5
+
+        try:
+            model_file = task.get_safe_textured_model(max_size_mb=max_size_mb)
+            return download_file_response(request, model_file, 'attachment')
+        except FileNotFoundError:
+            raise exceptions.NotFound(_("Asset does not exist"))

@@ -1,7 +1,7 @@
 from .tasks import TaskNestedView
-from .common import get_and_check_project
 from rest_framework.response import Response
 from rest_framework import exceptions
+
 
 class Scene(TaskNestedView):
     def get(self, request, pk=None, project_pk=None):
@@ -17,8 +17,6 @@ class Scene(TaskNestedView):
         Store potree scene information (except camera view)
         """
         task = self.get_and_check_task(request, pk)
-        # if (not task.public) or (task.public and not task.public_edit):
-        #     get_and_check_project(request, project_pk, perms=("change_project", ))
         scene = request.data
 
         # Quick type check
@@ -38,8 +36,6 @@ class CameraView(TaskNestedView):
         Store camera view information
         """
         task = self.get_and_check_task(request, pk)
-        # if (not task.public) or (task.public and not task.public_edit):
-        #     get_and_check_project(request, project_pk, perms=("change_project", ))
 
         view = request.data
         if not view:

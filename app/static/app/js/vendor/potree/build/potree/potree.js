@@ -52173,7 +52173,7 @@
 			this.boundingBox = this.sphere.geometry.boundingBox;
 			this.add(this.sphere);
 
-			this.label.visible = false;
+			this.label.visible = true;
 
 
 			let frameGeometry = new Geometry();
@@ -54096,20 +54096,69 @@
 			this.update();
 		};
 
-		getArea () {
-			let area = 0;
-			let j = this.points.length - 1;
-			for (let i = 0; i < this.points.length; i++) {
-				let p0 = this.points[0].position;
-				let p1 = this.points[i].position;
-				let p2 = this.points[j].position;
-				let a = (p2.y - p0.y) * (p1.z - p0.z) - (p2.z - p0.z) * (p1.y - p0.y);
-				let b = (p2.x - p0.x) * (p1.z - p0.z) - (p2.z - p0.z) * (p1.x - p0.x);
-				let c = (p2.x - p0.x) * (p1.y - p0.y) - (p2.y - p0.y) * (p1.x - p0.x);
-				area += Math.sqrt(a * a + b * b + c * c);
-				j = i;
+		// getArea () {
+		// 	let area = 0;
+		// 	let j = this.points.length - 1;
+		// 	for (let i = 0; i < this.points.length; i++) {
+		// 		let p0 = this.points[0].position;
+		// 		let p1 = this.points[i].position;
+		// 		let p2 = this.points[j].position;
+		// 		let a = (p2.y - p0.y) * (p1.z - p0.z) - (p2.z - p0.z) * (p1.y - p0.y);
+		// 		let b = (p2.x - p0.x) * (p1.z - p0.z) - (p2.z - p0.z) * (p1.x - p0.x);
+		// 		let c = (p2.x - p0.x) * (p1.y - p0.y) - (p2.y - p0.y) * (p1.x - p0.x);
+		// 		area += Math.sqrt(a * a + b * b + c * c);
+		// 		j = i;
+		// 	}
+		// 	return Math.abs(area / 2);
+		// };
+
+		getArea() {
+			if (this.points.length < 3) {
+				return 0;
 			}
-			return Math.abs(area / 2);
+
+			let areaVectorX = 0;
+			let areaVectorY = 0;
+			let areaVectorZ = 0;
+
+			const P0 = this.points[0].position;
+			const n = this.points.length;
+
+			// Loop through triangles P0, P_i, P_{i+1}. 
+			// The loop runs from i=1 up to n-1 (the second-to-last vertex).
+			// The vertices used are P0, P_i, and P_{i+1} (which wraps around using the modulo operator).
+			for (let i = 1; i < n; i++) {
+				// P_i (current vertex)
+				const Pi = this.points[i].position; 
+				
+				// P_{i+1} (next vertex)
+				const PiNext = this.points[(i + 1) % n].position; 
+
+				// Vector V01 = P_i - P0
+				const V0iX = Pi.x - P0.x;
+				const V0iY = Pi.y - P0.y;
+				const V0iZ = Pi.z - P0.z;
+
+				// Vector V02 = P_{i+1} - P0
+				const V0iNextX = PiNext.x - P0.x;
+				const V0iNextY = PiNext.y - P0.y;
+				const V0iNextZ = PiNext.z - P0.z;
+
+				// Calculate the Cross Product V0i x V0iNext = (a, b, c)
+				
+				const crossX = (V0iY * V0iNextZ) - (V0iZ * V0iNextY);
+				const crossY = (V0iZ * V0iNextX) - (V0iX * V0iNextZ);
+				const crossZ = (V0iX * V0iNextY) - (V0iY * V0iNextX);
+
+				// Sum the components of the cross product (area vector)
+				areaVectorX += crossX;
+				areaVectorY += crossY;
+				areaVectorZ += crossZ;
+			}
+
+			// The final area is half the magnitude of the resulting area vector.
+			// area = sqrt(Ax^2 + Ay^2 + Az^2) / 2.0
+			return Math.sqrt(areaVectorX * areaVectorX + areaVectorY * areaVectorY + areaVectorZ * areaVectorZ) / 2.0;
 		};
 
 		getTotalDistance () {
@@ -54187,7 +54236,8 @@
 				{ // coordinate labels
 					let coordinateLabel = this.coordinateLabels[0];
 					
-					let msg = position.toArray().map(p => Utils.addCommas(p.toFixed(2))).join(" / ");
+					let positions = position.toArray();
+					let msg = `${Utils.addCommas(positions[0].toFixed(3))} / ${Utils.addCommas(positions[1].toFixed(3))} / ${Utils.addCommas((positions[2] / window.viewer.lengthUnit.unitspermeter * window.viewer.lengthUnitDisplay.unitspermeter).toFixed(3))}`;
 					coordinateLabel.setText(msg);
 
 					coordinateLabel.visible = this.showCoordinates;
@@ -54356,8 +54406,8 @@
 					const N = AC.clone().cross(AB).normalize();
 
 					const center = Potree.Utils.computeCircleCenter(A, B, C);
-					const radius = center.distanceTo(A);
-
+					let radius = center.distanceTo(A);
+					if (isNaN(radius)) radius = 0;
 
 					const scale = radius / 20;
 					circleCenter.position.copy(center);
@@ -54380,11 +54430,16 @@
 					circleLine.position.copy(center);
 					circleLine.scale.set(radius, radius, radius);
 					circleLine.lookAt(target);
+
+					let suffix = "";
+					if(this.lengthUnit != null && this.lengthUnitDisplay != null){
+						radius = radius / this.lengthUnit.unitspermeter * this.lengthUnitDisplay.unitspermeter;
+						suffix = this.lengthUnitDisplay.code;
+					}
 					
 					circleRadiusLabel.visible = true;
 					circleRadiusLabel.position.copy(center.clone().add(B).multiplyScalar(0.5));
-					circleRadiusLabel.setText(`${radius.toFixed(3)}`);
-
+					circleRadiusLabel.setText(`${radius.toFixed(3)} ${suffix}`);
 				}
 			}
 
@@ -56322,7 +56377,8 @@
 
 	const LengthUnits = {
 		METER: {code: 'm', unitspermeter: 1.0},
-		FEET: {code: 'ft', unitspermeter: 3.28084},
+		FEET: {code: 'ft', unitspermeter: 1.0 / 0.3048},
+		FEET_US: {code: 'ft (US)', unitspermeter: 3937 / 1200},
 		INCH: {code: '\u2033', unitspermeter: 39.3701}
 	};
 
@@ -57597,6 +57653,10 @@ uniform int clipMethod;
 	uniform mat4 uClipPolygonWVP[num_clippolygons];
 #endif
 
+#if defined(num_cropvertices) && num_cropvertices > 0
+	uniform vec2 uCropVertices[num_cropvertices];
+#endif
+
 
 uniform float size;
 uniform float minSize;
@@ -58241,6 +58301,21 @@ float getPointSize(){
 	return pointSize;
 }
 
+#if defined(num_cropvertices) && num_cropvertices > 0
+bool pointInCropPolygon(vec3 point) {
+  int j = num_cropvertices - 1;
+  bool c = false;
+  for (int i = 0; i < num_cropvertices; i++) {
+    if ( ((uCropVertices[i].y>point.y) != (uCropVertices[j].y>point.y)) &&
+		 (point.x<(uCropVertices[j].x-uCropVertices[i].x) * (point.y-uCropVertices[i].y) / (uCropVertices[j].y-uCropVertices[i].y) + uCropVertices[i].x) ){
+       c = !c;
+	}
+	j = i;
+  }
+  return c;
+}
+#endif
+
 #if defined(num_clippolygons) && num_clippolygons > 0
 bool pointInClipPolygon(vec3 point, int polyIdx) {
 
@@ -58352,6 +58427,16 @@ void doClipping(){
 			clipVolumesCount++;
 		}	
 	#endif
+
+	#if defined(num_cropvertices) && num_cropvertices > 0
+		// vec4 worldPos = modelMatrix * vec4(position, 1.0);
+
+		if (!pointInCropPolygon(position)){
+			gl_Position = vec4(100.0, 100.0, 100.0, 0.0);
+			return;
+		}
+	#endif
+
 
 	#if defined(num_clippolygons) && num_clippolygons > 0
 		for(int i = 0; i < num_clippolygons; i++) {
@@ -63192,6 +63277,18 @@ void main() {
 					}
 				}
 
+				if (material.cropVertices && material.cropVertices.length > 0){
+					let flattenedVertices = new Array(2 * material.cropVertices.length);
+					for(let i = 0; i < material.cropVertices.length; i++){
+						// We simply subtract the translation elements from the world matrix
+						// since we know that the other parameters are the identity matrix
+						flattenedVertices[i * 2 + 0] = material.cropVertices[i].x - world.elements[12];
+						flattenedVertices[i * 2 + 1] = material.cropVertices[i].y - world.elements[13];
+					}
+					const lCropVertices = shader.uniformLocations["uCropVertices[0]"];
+					gl.uniform2fv(lCropVertices, flattenedVertices);
+				}
+
 
 				//shader.setUniformMatrix4("modelMatrix", world);
 				//shader.setUniformMatrix4("modelViewMatrix", worldView);
@@ -63479,6 +63576,7 @@ void main() {
 					let numClipBoxes = (material.clipBoxes && material.clipBoxes.length) ? material.clipBoxes.length : 0;
 					let numClipSpheres = (params.clipSpheres && params.clipSpheres.length) ? params.clipSpheres.length : 0;
 					let numClipPolygons = (material.clipPolygons && material.clipPolygons.length) ? material.clipPolygons.length : 0;
+					let numCropVertices = (material.cropVertices && material.cropVertices.length) ? material.cropVertices.length : 0;
 
 					let defines = [
 						`#define num_shadowmaps ${shadowMaps.length}`,
@@ -63486,6 +63584,7 @@ void main() {
 						`#define num_clipboxes ${numClipBoxes}`,
 						`#define num_clipspheres ${numClipSpheres}`,
 						`#define num_clippolygons ${numClipPolygons}`,
+						`#define num_cropvertices ${numCropVertices}`,
 					];
 
 
@@ -72476,6 +72575,8 @@ void main() {
 				});
 
 			let headerValues = [];
+			const skipFields = ["intensity", "return number", "number of returns", "source id", "gpsTime"];
+
 			for (let attribute of attributes) {
 				let itemSize = points.data[attribute].length / points.numPoints;
 
@@ -72487,24 +72588,28 @@ void main() {
 					for (let i = 0; i < itemSize; i++) {
 						headerValues.push(`${attribute}_${i}`);
 					}
-				} else {
+				} else if (skipFields.indexOf(attribute) === -1){
 					headerValues.push(attribute);
 				}
 			}
-			string = headerValues.join(', ') + '\n';
+			string = headerValues.join(',') + '\n';
 
 			for (let i = 0; i < points.numPoints; i++) {
 				let values = [];
 
 				for (let attribute of attributes) {
+					if (skipFields.indexOf(attribute) !== -1) continue;
 					let itemSize = points.data[attribute].length / points.numPoints;
 					let value = points.data[attribute]
 						.subarray(itemSize * i, itemSize * i + itemSize)
 						.join(', ');
+					if (attribute === "mileage"){
+						value = value / window.viewer.lengthUnit.unitspermeter * window.viewer.lengthUnitDisplay.unitspermeter;
+					}
 					values.push(value);
 				}
 
-				string += values.join(', ') + '\n';
+				string += values.join(',') + '\n';
 			}
 
 			return string;
@@ -73023,24 +73128,20 @@ void main() {
 								transform = value => value / scale + offset;
 							}
 
-							
-
-							
-
 							if (attributeName === 'position') {
-								let values = [...position].map(v => Utils.addCommas(v.toFixed(3)));
+								let values = [...position];
 								html += `
 								<tr>
 									<td>x</td>
-									<td>${values[0]}</td>
+									<td>${Utils.addCommas(values[0].toFixed(3))}</td>
 								</tr>
 								<tr>
 									<td>y</td>
-									<td>${values[1]}</td>
+									<td>${Utils.addCommas(values[1].toFixed(3))}</td>
 								</tr>
 								<tr>
 									<td>z</td>
-									<td>${values[2]}</td>
+									<td>${Utils.addCommas((values[2] / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter).toFixed(3))}</td>
 								</tr>`;
 							} else if (attributeName === 'rgba') {
 								html += `
@@ -73054,12 +73155,12 @@ void main() {
 								html += `
 								<tr>
 									<td>${attributeName}</td>
-									<td>${value.toFixed(3)}</td>
+									<td>${(value / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter).toFixed(3)}</td>
 								</tr>`;
-							} else {
+							} else if (attributeName === "classification") {
 								html += `
 								<tr>
-									<td>${attributeName}</td>
+									<td style="padding-right: 4px">${attributeName}</td>
 									<td>${transform(value)}</td>
 								</tr>`;
 							}
@@ -73136,6 +73237,7 @@ void main() {
 						let trueElevationPosition = new Float32Array(originPos);
 						for(let i = 0; i < pointSet.numPoints; i++){
 							trueElevationPosition[3 * i + 2] += pointcloud.position.z;
+							trueElevationPosition[3 * i + 2] = trueElevationPosition[3 * i + 2] / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter;
 						}
 
 						pointSet.data.position = trueElevationPosition;
@@ -73338,6 +73440,7 @@ void main() {
 				.orient('bottom')
 				.innerTickSize(-height)
 				.outerTickSize(1)
+				.tickFormat(v => (v / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter).toFixed(0))
 				.tickPadding(10)
 				.ticks(width / 50);
 
@@ -73347,6 +73450,7 @@ void main() {
 				.innerTickSize(-width)
 				.outerTickSize(1)
 				.tickPadding(10)
+				.tickFormat(v => (v / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter).toFixed(0))
 				.ticks(height / 20);
 
 			this.elXAxis = this.svg.append('g')
@@ -73473,7 +73577,7 @@ void main() {
 				.range([0, width]);
 			this.scaleY.domain([this.camera.bottom + this.camera.position.z, this.camera.top + this.camera.position.z])
 				.range([height, 0]);
-
+			
 			let marginLeft = this.renderArea[0].offsetLeft;
 
 			this.xAxis.scale(this.scaleX)
@@ -74083,13 +74187,13 @@ ENDSEC
 			for (let point of points) {
 				let x = Utils.addCommas(point.x.toFixed(3));
 				let y = Utils.addCommas(point.y.toFixed(3));
-				let z = Utils.addCommas(point.z.toFixed(3));
+				let z = Utils.addCommas((point.z / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter).toFixed(3));
 
 				let row = $(`
 				<tr>
 					<td><span>${x}</span></td>
 					<td><span>${y}</span></td>
-					<td><span>${z}</span></td>
+					<td><span data-dyn-value="${point.z}">${z}</span></td>
 					<td align="right" style="width: 25%">
 						<img name="copy" title="copy" class="button-icon" src="${copyIconPath}" style="width: 16px; height: 16px"/>
 					</td>
@@ -74318,7 +74422,10 @@ ENDSEC
 			elCoordiantesContainer.append(this.createCoordinatesTable(this.measurement.points.map(p => p.position)));
 
 			let elArea = this.elContent.find(`#measurement_area`);
-			elArea.html(this.measurement.getArea().toFixed(3));
+			let area = this.measurement.getArea();
+			elArea.html((area / (this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnit.unitspermeter) * (this.viewer.lengthUnitDisplay.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter)).toFixed(3));
+			elArea.attr('data-dyn-value', area);
+			elArea.attr('data-dyn-type', 'area');			
 		}
 	};
 
@@ -74443,10 +74550,13 @@ ENDSEC
 				return Potree.Utils.addCommas(number.toFixed(3));
 			};
 
+			const convFactor = (1.0 / this.viewer.lengthUnit.unitspermeter) * this.viewer.lengthUnitDisplay.unitspermeter;
+
 			
-			const txtCenter = `${format(center.x)} ${format(center.y)} ${format(center.z)}`;
-			const txtRadius = format(radius);
-			const txtCircumference = format(circumference);
+			const txtXYCenter = `${format(center.x)} ${format(center.y)}`;
+			const txtZCenter = format(center.z * convFactor);
+			const txtRadius = format(radius * convFactor);
+			const txtCircumference = format(circumference * convFactor);
 
 			const thStyle = `style="text-align: left"`;
 			const tdStyle = `style="width: 100%; padding: 5px;"`;
@@ -74458,16 +74568,16 @@ ENDSEC
 			</tr>
 			<tr>
 				<td ${tdStyle} colspan="2">
-					${txtCenter}
+					<span>${txtXYCenter}</span> <span data-dyn-value="${center.z}">${txtZCenter}</span>
 				</td>
 			</tr>
 			<tr>
 				<th ${thStyle}>Radius: </th>
-				<td ${tdStyle}>${txtRadius}</td>
+				<td ${tdStyle} data-dyn-value="${radius}">${txtRadius}</td>
 			</tr>
 			<tr>
 				<th ${thStyle}>Circumference: </th>
-				<td ${tdStyle}>${txtCircumference}</td>
+				<td ${tdStyle} data-dyn-value="${circumference}">${txtCircumference}</td>
 			</tr>
 		`);
 		}
@@ -74482,7 +74592,7 @@ ENDSEC
 			<div class="measurement_content selectable">
 				<span class="coordinates_table_container"></span>
 				<br>
-				<span id="height_label">Height: </span><br>
+				<b>Height:</b> <span id="height_label"></span><br>
 
 				<!-- ACTIONS -->
 				<div style="display: flex; margin-top: 12px">
@@ -74519,10 +74629,11 @@ ENDSEC
 				let min = lowPoint.z;
 				let max = highPoint.z;
 				let height = max - min;
-				height = height.toFixed(3);
+				let displayHeight = height / this.viewer.lengthUnit.unitspermeter * this.viewer.lengthUnitDisplay.unitspermeter;
 
 				this.elHeightLabel = this.elContent.find(`#height_label`);
-				this.elHeightLabel.html(`<b>Height:</b> ${height}`);
+				this.elHeightLabel.text(`${displayHeight.toFixed(3)}`);
+				this.elHeightLabel.attr('data-dyn-value', height);
 			}
 		}
 	};
@@ -74931,7 +75042,7 @@ ENDSEC
 
 				<br>
 
-				<input type="button" id="show_2d_profile" value="show 2d profile" style="width: 100%"/>
+				<input type="button" id="show_2d_profile" value="Show 2D Profile" style="width: 100%"/>
 
 				<!-- ACTIONS -->
 				<div style="display: flex; margin-top: 12px">
@@ -88614,6 +88725,9 @@ ENDSEC
 				case 'ft':
 					this.lengthUnit = LengthUnits.FEET;
 					break;
+				case 'ft (US)':
+					this.lengthUnit = LengthUnits.FEET_US;
+					break;
 				case 'in':
 					this.lengthUnit = LengthUnits.INCH;
 					break;
@@ -88626,12 +88740,35 @@ ENDSEC
 				case 'ft':
 					this.lengthUnitDisplay = LengthUnits.FEET;
 					break;
+				case 'ft (US)':
+					this.lengthUnitDisplay = LengthUnits.FEET_US;
+					break;
 				case 'in':
 					this.lengthUnitDisplay = LengthUnits.INCH;
 					break;
 			}
 
 			this.dispatchEvent({ 'type': 'length_unit_changed', 'viewer': this, value: lengthUnitValue });
+			
+			let self = this;
+			$('#potree_sidebar_container [data-dyn-value]').each(function(){
+				const $el = $(this);
+				const dynValue = parseFloat($el.attr('data-dyn-value'));
+				if (isNaN(dynValue)) return;
+
+				const dynType = $el.attr('data-dyn-type');
+				
+				let lu = self.lengthUnit.unitspermeter;
+				let lud =  self.lengthUnitDisplay.unitspermeter;
+
+				// Update the unit text based on the new display unit
+				if (dynType === 'area') {
+					lud *= lud;
+					lu *= lu;
+				}
+
+				$el.text((dynValue / lu * lud).toFixed(3));
+			});
 		};
 
 		zoomTo(node, factor, animationDuration = 0){

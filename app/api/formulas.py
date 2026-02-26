@@ -97,7 +97,7 @@ algos = {
         'help': _('Optimized Soil Adjusted Vegetation Index is based on SAVI, but tends to work better in areas with little vegetation where soil is visible.')
     },
     'LAI': {
-        'expr': '3.618 * (2.5 * (N - R) / (N + 6*R - 7.5*B + 1)) * 0.118',
+        'expr': '3.618 * (2.5 * (N - R) / (N + 6*R - 7.5*B + 1)) - 0.118',
         'help': _('Leaf Area Index estimates foliage areas and predicts crop yields.'),
         'range': (-1, 1)
     },
@@ -152,6 +152,8 @@ camera_filters = [
     'BGRNReL',
     'BGRReNL',
 
+    'BGRNReP',
+    'RGBNReP',
     'RGBNRePL',
 
     'L', # FLIR camera has a single LWIR band
@@ -249,7 +251,7 @@ def get_auto_bands(orthophoto_bands, formula):
     max_bands = len(orthophoto_bands) - 1 # minus alpha
     filters = get_camera_filters_for(algo['expr'], max_bands)
     if not filters:
-        raise valueError(f"Cannot find filters for {algo} with max bands {max_bands}")
+        raise ValueError(f"Cannot find filters for {algo} with max bands {max_bands}")
 
     bands_lookup = get_bands_lookup()
     band_order = ""

@@ -5,6 +5,7 @@ import L from 'leaflet';
 import './ContoursPanel.scss';
 import ErrorMessage from 'webodm/components/ErrorMessage';
 import Workers from 'webodm/classes/Workers';
+import Utils from 'webodm/classes/Utils';
 import { _ } from 'webodm/classes/gettext';
 import { systems, getUnitSystem, onUnitSystemChanged, offUnitSystemChanged, toMetric } from 'webodm/classes/Units';
 
@@ -39,8 +40,8 @@ export default class ContoursPanel extends React.Component {
         simplify: Storage.getItem("last_contours_simplify_" + unitSystem) || defaultSimplify,
         customSimplify: Storage.getItem("last_contours_custom_simplify_" + unitSystem) || defaultSimplify,
         layer: "",
-        epsg: Storage.getItem("last_contours_epsg") || "4326",
-        customEpsg: Storage.getItem("last_contours_custom_epsg") || "4326",
+        epsg: props.tasks[0].epsg || "3857",
+        customEpsg: Storage.getItem("last_contours_custom_epsg") || "3857",
         layers: [],
         loading: true,
         task: props.tasks[0] || null,
@@ -276,16 +277,36 @@ export default class ContoursPanel extends React.Component {
             previewLoading, previewLayer, unitSystem } = this.state;
     const us = systems[unitSystem];
     const lengthUnit = us.lengthUnit(1); 
+    
+    const projEPSG = task.epsg;
+    let projSrsName = task.srs?.name;
+    if (!projSrsName && projEPSG) projSrsName = `EPSG:${projEPSG}`;
+    else if (projSrsName && projEPSG) projSrsName = `${projSrsName} (EPSG:${projEPSG})`;
+
+
 
     const intervalStart = unitSystem === "metric" ? 1 : 4;
     const intervalValues = [intervalStart / 4, intervalStart / 2, intervalStart, intervalStart * 2, intervalStart * 4];
-    const simplifyValues = [{label: _('Do not simplify'), value: 0},
+    const simplifyValues = [{label: _('Minimal'), value: unitSystem === "metric" ? 0.01 : 0.04},
                             {label: _('Normal'), value: unitSystem === "metric" ? 0.2 : 0.5},
                             {label: _('Aggressive'), value: unitSystem === "metric" ? 1 : 4}];
 
-    const disabled = (interval === "custom" && !customInterval) ||
+    let disabled = (interval === "custom" && !Utils.isNumeric(customInterval)) ||
                       (epsg === "custom" && !customEpsg) ||
-                      (simplify === "custom" && !customSimplify);
+                      (simplify === "custom" && !Utils.isNumeric(customSimplify));
+    let highlightCustomInterval = false;
+    let highlightCustomSimplify = false;
+
+    if (interval === "custom" && Utils.isNumeric(customInterval)){
+      if (toMetric(customInterval, lengthUnit).value < 0.1){
+        disabled = highlightCustomInterval = true;
+      }
+    }
+    if (simplify === "custom" && Utils.isNumeric(customSimplify)){
+      if (toMetric(customSimplify, lengthUnit).value < 0.01){
+        disabled = highlightCustomSimplify = true;
+      }
+    }
 
     let content = "";
     if (loading) content = (<span><i className="fa fa-circle-notch fa-spin"></i> {_("Loading…")}</span>);
@@ -306,7 +327,7 @@ export default class ContoursPanel extends React.Component {
           <div className="row form-group form-inline">
             <label className="col-sm-3 control-label">{_("Value:")}</label>
             <div className="col-sm-9 ">
-              <input type="number" className="form-control custom-interval" value={customInterval} onChange={this.handleChangeCustomInterval} /><span> {lengthUnit.label}</span>
+              <input type="number" className={"form-control custom-interval " + (highlightCustomInterval ? "theme-background-failed" : "")} value={customInterval} onChange={this.handleChangeCustomInterval} /><span> {lengthUnit.label}</span>
             </div>
           </div>
         : ""}
@@ -333,15 +354,16 @@ export default class ContoursPanel extends React.Component {
           <div className="row form-group form-inline">
             <label className="col-sm-3 control-label">{_("Value:")}</label>
             <div className="col-sm-9 ">
-              <input type="number" className="form-control custom-interval" value={customSimplify} onChange={this.handleChangeCustomSimplify} /><span> {lengthUnit.label}</span>
-            </div>
+              <input type="number" className={"form-control custom-interval " + (highlightCustomSimplify ? "theme-background-failed" : "")} value={customSimplify} onChange={this.handleChangeCustomSimplify} /><span> {lengthUnit.label}</span>
+            </div>  
           </div>
         : ""}
 
         <div className="row form-group form-inline">
-          <label className="col-sm-3 control-label">{_("Projection:")}</label>
+          <label className="col-sm-3 control-label">{_("SRS:")}</label>
           <div className="col-sm-9 ">
-            <select className="form-control" value={epsg} onChange={this.handleSelectEpsg}>
+            <select className="form-control crs" value={epsg} onChange={this.handleSelectEpsg} title={epsg == projEPSG ? projSrsName : ""}>
+              {projEPSG ? <option value={projEPSG}>{projSrsName}</option> : ""}
               <option value="4326">{_("Lat/Lon")} (EPSG:4326)</option>
               <option value="3857">{_("Web Mercator")} (EPSG:3857)</option>
               <option value="custom">{_("Custom")} EPSG</option>
