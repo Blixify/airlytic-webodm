@@ -50,6 +50,14 @@ class ProjectSerializer(serializers.ModelSerializer):
 
 class ProjectFilter(filters.FilterSet):
     search = filters.CharFilter(method='filter_search')
+    has_tasks = filters.BooleanFilter(method='filter_has_tasks')
+
+    def filter_has_tasks(self, qs, name, value):
+        if value is True:
+            return qs.filter(task__isnull=False).distinct()
+        if value is False:
+            return qs.filter(task__isnull=True)
+        return qs
 
     def filter_search(self, qs, name, value):
         value = value.replace(":", "#")
@@ -93,7 +101,7 @@ class ProjectFilter(filters.FilterSet):
 
     class Meta:
         model = models.Project
-        fields = ['search', 'id', 'name', 'description', 'created_at']
+        fields = ['search', 'id', 'name', 'description', 'created_at', 'has_tasks']
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
