@@ -63,11 +63,13 @@ class ProjectFilter(filters.FilterSet):
     def filter_tags(self, qs, name, value):
         # Exact-match tag filter for per-user list scoping (?tags=user-<uid>).
         # Multiple tags can be comma-separated — each must be present (AND).
+        # `tags` is a TextField storing space-separated tag names, so we match
+        # via word-boundary regex (so "user-abc" doesn't also hit "user-abcdef").
         if not value:
             return qs
         tag_names = [t.strip() for t in value.split(',') if t.strip()]
         for t in tag_names:
-            qs = qs.filter(tags__name__iexact=t)
+            qs = qs.filter(tags__iregex=r'(^|\s)' + re.escape(t) + r'(\s|$)')
         return qs.distinct()
 
     def filter_search(self, qs, name, value):
@@ -101,7 +103,7 @@ class ProjectFilter(filters.FilterSet):
                 Q(n_search=name_query)
                 | Q(name__icontains=names)
                 | Q(description__icontains=names)
-                | Q(tags__name__icontains=names)
+                | Q(tags__icontains=names)
             )
 
         if len(task_tags) > 0:
