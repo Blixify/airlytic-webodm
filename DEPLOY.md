@@ -36,12 +36,14 @@ Old containers keep serving while the new image bakes. Takes ~5–15 minutes the
 ### 4. Swap the webapp container (~15–30s API downtime)
 
 ```bash
-docker-compose stop webapp
-docker-compose rm -f webapp
+docker-compose stop webapp worker
+docker-compose rm -f webapp worker
 ./webodm.sh start --ssl --hostname <webodm-host> --detached
 ```
 
-`stop` + `rm` is the workaround for the docker-compose 1.29 `'ContainerConfig'` recreate bug. `./webodm.sh start --ssl` is required (not bare `docker-compose up`) because the SSL volume mounts and `WO_SSL_*` env vars are wired in by the wrapper script.
+Both `webapp` and `worker` use the same docker image (`opendronemap/webodm_webapp`). When you rebuild that image, docker-compose will try to recreate **both** containers on the next `up` and will hit the docker-compose 1.29 `'ContainerConfig'` bug on either of them. The `stop` + `rm` of both up front is the workaround. Worker downtime is brief (~15–30s) and any in-flight Celery task (upload to a node, download of results) is re-queued automatically by the broker on restart. NodeODM nodes themselves are not touched, so in-progress OpenDroneMap pipelines on a node keep running.
+
+`./webodm.sh start --ssl` is required (not bare `docker-compose up`) because the SSL volume mounts and `WO_SSL_*` env vars are wired in by the wrapper script.
 
 > If you originally provisioned SSL with explicit cert paths instead of the built-in `--ssl` flag, substitute:
 > ```bash
@@ -123,13 +125,13 @@ This instance uses Let's Encrypt via `webodm.sh --ssl`, which runs `nginx/letsen
 
 ## Troubleshooting
 
-### `ERROR: for webapp 'ContainerConfig'` during `docker-compose up`
+### `ERROR: for webapp 'ContainerConfig'` / `ERROR: for worker 'ContainerConfig'` during `docker-compose up`
 
-Known docker-compose 1.29.2 bug with newer Docker Engine — the `ContainerConfig` key was removed from image metadata. Only triggers on the **recreate** path. Workaround:
+Known docker-compose 1.29.2 bug with newer Docker Engine — the `ContainerConfig` key was removed from image metadata. Only triggers on the **recreate** path. Hits both `webapp` and `worker` because they share the same image. Workaround (stop + rm both up front):
 
 ```bash
-docker-compose stop webapp
-docker-compose rm -f webapp
+docker-compose stop webapp worker
+docker-compose rm -f webapp worker
 ./webodm.sh start --ssl --hostname <webodm-host> --detached
 ```
 
