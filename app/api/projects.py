@@ -51,6 +51,7 @@ class ProjectSerializer(serializers.ModelSerializer):
 class ProjectFilter(filters.FilterSet):
     search = filters.CharFilter(method='filter_search')
     has_tasks = filters.BooleanFilter(method='filter_has_tasks')
+    tags = filters.CharFilter(method='filter_tags')
 
     def filter_has_tasks(self, qs, name, value):
         if value is True:
@@ -58,6 +59,16 @@ class ProjectFilter(filters.FilterSet):
         if value is False:
             return qs.filter(task__isnull=True)
         return qs
+
+    def filter_tags(self, qs, name, value):
+        # Exact-match tag filter for per-user list scoping (?tags=user-<uid>).
+        # Multiple tags can be comma-separated — each must be present (AND).
+        if not value:
+            return qs
+        tag_names = [t.strip() for t in value.split(',') if t.strip()]
+        for t in tag_names:
+            qs = qs.filter(tags__name__iexact=t)
+        return qs.distinct()
 
     def filter_search(self, qs, name, value):
         value = value.replace(":", "#")
@@ -76,12 +87,22 @@ class ProjectFilter(filters.FilterSet):
 
         if len(users) > 0:
             qs = qs.filter(owner__username__iexact=users[0][1:])
-        
+
         if len(names) > 0:
-            project_name_vec = SearchVector("name")
+            # FTS over name + description + aggregated task names keeps stemming
+            # and multi-term semantics. icontains fallback over name, description,
+            # and tag names recovers substring matches ("JIE" -> "JIEMIN") and
+            # surfaces description-embedded fields (address, cameraModels,
+            # customProjectId) and raw tag values that don't carry a "#" prefix.
+            project_name_vec = SearchVector("name") + SearchVector("description")
             task_name_vec = SearchVector(StringAgg("task__name", delimiter=' '))
             name_query = SearchQuery(names, search_type="plain")
-            qs = qs.annotate(n_search=project_name_vec + task_name_vec).filter(n_search=name_query)
+            qs = qs.annotate(n_search=project_name_vec + task_name_vec).filter(
+                Q(n_search=name_query)
+                | Q(name__icontains=names)
+                | Q(description__icontains=names)
+                | Q(tags__name__icontains=names)
+            )
 
         if len(task_tags) > 0:
             task_tags_vec = SearchVector("task__tags")
@@ -101,7 +122,7 @@ class ProjectFilter(filters.FilterSet):
 
     class Meta:
         model = models.Project
-        fields = ['search', 'id', 'name', 'description', 'created_at', 'has_tasks']
+        fields = ['search', 'id', 'name', 'description', 'created_at', 'has_tasks', 'tags']
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
