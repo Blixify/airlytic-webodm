@@ -4,6 +4,7 @@ from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.pagination import PageNumberPagination
 from django_filters import rest_framework as filters
 from django.db import transaction
 from django.contrib.auth.models import User
@@ -127,15 +128,24 @@ class ProjectFilter(filters.FilterSet):
         fields = ['search', 'id', 'name', 'description', 'created_at', 'has_tasks', 'tags']
 
 
+class ProjectPagination(PageNumberPagination):
+    # Allows the client to control results-per-page via ?page_size=<n>.
+    # Default page size stays at settings.PAGE_SIZE (10) when not provided.
+    # max_page_size caps it to prevent oversized/abusive requests.
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
 class ProjectViewSet(viewsets.ModelViewSet):
     """
     Project get/add/delete/update
     Projects are the building blocks
     of processing. Each project can have zero or more tasks associated with it.
-    Users can fine tune the permissions on projects, including whether users/groups have 
+    Users can fine tune the permissions on projects, including whether users/groups have
     access to view, add, change or delete them.
     """
     filter_fields = ('id', 'name', 'description', 'created_at')
+    pagination_class = ProjectPagination
     serializer_class = ProjectSerializer
     queryset = models.Project.objects.prefetch_related('task_set').filter(deleting=False).order_by('-created_at')
     filterset_class = ProjectFilter
