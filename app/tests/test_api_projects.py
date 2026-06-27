@@ -168,6 +168,46 @@ class TestApiProjects(BootTestCase):
         self.assertTrue(os.path.isdir(task_dir))
         self.assertTrue(os.path.isdir(project_dir))
 
+    def test_project_pagination_page_size(self):
+        client = APIClient()
+        client.login(username="testuser", password="test1234")
+        user = User.objects.get(username="testuser")
+
+        # Seed 25 projects sharing a searchable keyword + a common tag
+        for i in range(25):
+            Project.objects.create(
+                owner=user,
+                name="PaginationTest Project {}".format(i),
+                description="paginationkeyword project",
+                tags="pgtag"
+            )
+
+        # Default page size stays 10 when page_size is not provided
+        res = client.get("/api/projects/?page=1")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data["results"]), 10)
+
+        # Client controls results-per-page via ?page_size
+        res = client.get("/api/projects/?page=1&page_size=20")
+        self.assertEqual(len(res.data["results"]), 20)
+
+        res = client.get("/api/projects/?page=1&page_size=5")
+        self.assertEqual(len(res.data["results"]), 5)
+
+        # page_size composes with the custom search filter (filtering runs
+        # before pagination, so count reflects the filtered total and the
+        # page is sliced from the filtered set)
+        res = client.get("/api/projects/?page=1&page_size=20&search=PaginationTest")
+        self.assertEqual(res.data["count"], 25)
+        self.assertEqual(len(res.data["results"]), 20)
+        for p in res.data["results"]:
+            self.assertIn("PaginationTest", p["name"])
+
+        # page_size composes with the per-user tags filter
+        res = client.get("/api/projects/?page=1&page_size=15&tags=pgtag")
+        self.assertEqual(res.data["count"], 25)
+        self.assertEqual(len(res.data["results"]), 15)
+
         
 
 
