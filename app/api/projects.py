@@ -53,6 +53,11 @@ class ProjectFilter(filters.FilterSet):
     search = filters.CharFilter(method='filter_search')
     has_tasks = filters.BooleanFilter(method='filter_has_tasks')
     tags = filters.CharFilter(method='filter_tags')
+    # Created-date range filter for the project-list "Created Date" From/To control.
+    # Frontend sends ?created_at__gte=<ISO> and ?created_at__lte=<ISO> (day-inclusive
+    # boundaries, T00:00:00 / T23:59:59). gte/lte on the datetime field give an inclusive range.
+    created_at__gte = filters.DateTimeFilter(field_name='created_at', lookup_expr='gte')
+    created_at__lte = filters.DateTimeFilter(field_name='created_at', lookup_expr='lte')
 
     def filter_has_tasks(self, qs, name, value):
         if value is True:
@@ -125,7 +130,7 @@ class ProjectFilter(filters.FilterSet):
 
     class Meta:
         model = models.Project
-        fields = ['search', 'id', 'name', 'description', 'created_at', 'has_tasks', 'tags']
+        fields = ['search', 'id', 'name', 'description', 'created_at', 'created_at__gte', 'created_at__lte', 'has_tasks', 'tags']
 
 
 class ProjectPagination(PageNumberPagination):
