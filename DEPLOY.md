@@ -2,8 +2,6 @@
 
 Operational playbook for shipping changes from this fork to the production WebODM instance at `https://<webodm-host>` (single host, SSL via certbot, behind no proxy).
 
-For verifying behaviour after a deploy, the airlytic-nextjs repo ships `scripts/test-webodm-filters.mjs` — a Node 18 predicate suite that hits the WebODM API end-to-end. Layer A covers health (JWT, baseline, has_tasks split, pagination envelope, Swagger); Layer B covers filter behaviour (`?tags=`, `?search=` over name / description / tag values). Exit 1 on any FAIL.
-
 ---
 
 ## The recommended path — minimal downtime
@@ -66,15 +64,6 @@ docker logs -f webapp 2>&1 | tail -30
 ```bash
 curl -ks https://<webodm-host>/api/projects/?page=1 -o /dev/null -w "%{http_code}\n"
 # expect: 200
-```
-
-From the airlytic-nextjs repo on your laptop:
-
-```bash
-cd ~/Documents/Work.nosync/Airlytic/airlytic-nextjs
-set -a && source .env && set +a
-node scripts/test-webodm-filters.mjs
-# expect: "13 passed, 0 failed"
 ```
 
 ### Impact summary
@@ -183,8 +172,6 @@ docker-compose stop webapp
 docker-compose rm -f webapp
 ./webodm.sh start --ssl --hostname <webodm-host> --detached
 ```
-
-Then re-run `node scripts/test-webodm-filters.mjs` from airlytic-nextjs to confirm green.
 
 ---
 
